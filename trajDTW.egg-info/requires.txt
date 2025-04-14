@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+scipy
+scanpy
+fastdtw
+tqdm
+joblib
+scikit-learn
