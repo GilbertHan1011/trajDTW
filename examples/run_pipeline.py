@@ -19,7 +19,8 @@ from trajDTW import (
     anndata_to_3d_matrix, 
     calculate_trajectory_conservation,
     TrajectoryFitter,
-    get_most_conserved_samples
+    get_most_conserved_samples,
+    fit_with_conserved_samples
 )
 
 # Set output directory
@@ -115,6 +116,8 @@ conservation_results = calculate_trajectory_conservation(
     dtw_radius=3,            # Radius parameter for fastdtw
     use_fastdtw=True,
     normalize='zscore',      # Normalize trajectories before DTW calculation
+    n_jobs=4,                # Use 4 parallel jobs for calculation
+    show_progress=True,      # Show progress bar
     **filter_params          # Apply sample variation filtering
 )
 
@@ -170,7 +173,7 @@ viz_dir = output_dir / "visualizations"
 viz_dir.mkdir(exist_ok=True)
 
 # 1. Sample similarity heatmap
-print("Creating sample similarity heatmap...")
+print("Creating larity heatmap...")
 plt.figure(figsize=(10, 8))
 sim_matrix = similarity_matrix.values
 sns.heatmap(sim_matrix, cmap='viridis', vmin=0, vmax=1, 
@@ -300,104 +303,28 @@ for i, gene_name in enumerate(top_gene_names):
 # Create time points
 time_points = np.linspace(0, 1, reshaped_data.shape[1])
 
-# Initialize TrajectoryFitter
-print("Initializing TrajectoryFitter...")
-fitter = TrajectoryFitter(
+# Use the enhanced fit_with_conserved_samples function
+print("\nProcessing genes with fit_with_conserved_samples...")
+print("This function will parallelize the gene processing and show a progress bar")
+
+fitting_results = fit_with_conserved_samples(
+    reshaped_data=reshaped_data, 
+    gene_names=top_gene_names,
+    conserved_samples=conserved_samples,
     time_points=time_points,
     n_jobs=4,  # Use 4 parallel jobs
-    verbose=True,
-    interpolation_factor=2  # Increase for smoother curves
+    verbose=True,  # Show progress bar
+    interpolation_factor=2,  # Increase for smoother curves
+    model_type='spline',
+    spline_degree=3,
+    spline_smoothing=0.5,
+    use_dtw_optimization=True  # Perform DTW optimization
 )
 
-# Process each gene individually
-print("\nProcessing each gene with its most conserved samples...")
-standard_results = {
-    'fitted_params': [],
-    'fitted_trajectories': [],
-    'dtw_distances': [],
-    'smoothing_values': []
-}
-
-optimized_results = {
-    'fitted_params': [],
-    'fitted_trajectories': [],
-    'dtw_distances': [],
-    'smoothing_values': []
-}
-
-# Process each gene separately
-# This is different from the original approach:
-# - Original: Process all genes at once with a single call to fitter.fit()
-# - New: Process each gene individually, using only its most conserved samples
-# The benefits:
-# - Better fits for each gene as we're using only the most reliable samples
-# - Gene-specific optimization instead of a global approach
-# - Potentially better dynamics capture as outlier/noisy samples are excluded
-for i, gene_name in enumerate(top_gene_names):
-    print(f"\nProcessing gene {i+1}/{len(top_gene_names)}: {gene_name}")
-    
-    # Get data for this gene
-    gene_data = top_genes_data[i]
-    
-    # Fit standard spline model for this gene
-    print(f"  Fitting standard spline model...")
-    gene_standard_results = fitter.fit(
-        gene_data,
-        model_type='spline',
-        spline_degree=3,
-        spline_smoothing=0.5,
-        optimize_spline_dtw=False
-    )
-    
-    # Fit DTW-optimized spline model for this gene
-    print(f"  Fitting DTW-optimized spline model...")
-    gene_optimized_results = fitter.fit(
-        gene_data,
-        model_type='spline',
-        spline_degree=3,
-        spline_smoothing=0.5,  # Initial value, will be optimized
-        optimize_spline_dtw=True
-    )
-    
-    # Store results
-    standard_results['fitted_params'].append(gene_standard_results['fitted_params'][0])
-    standard_results['fitted_trajectories'].append(gene_standard_results['fitted_trajectories'][:, 0])
-    standard_results['dtw_distances'].append(gene_standard_results['dtw_distances'][0])
-    standard_results['smoothing_values'].append(gene_standard_results['smoothing_values'][0])
-    
-    optimized_results['fitted_params'].append(gene_optimized_results['fitted_params'][0])
-    optimized_results['fitted_trajectories'].append(gene_optimized_results['fitted_trajectories'][:, 0])
-    optimized_results['dtw_distances'].append(gene_optimized_results['dtw_distances'][0])
-    optimized_results['smoothing_values'].append(gene_optimized_results['smoothing_values'][0])
-    
-    # Print comparison for this gene
-    std_dtw = gene_standard_results['dtw_distances'][0]
-    opt_dtw = gene_optimized_results['dtw_distances'][0]
-    improvement = std_dtw - opt_dtw
-    percent_improvement = 100 * improvement / std_dtw if std_dtw > 0 else 0
-    std_smooth = gene_standard_results['smoothing_values'][0]
-    opt_smooth = gene_optimized_results['smoothing_values'][0]
-    
-    print(f"  Results for {gene_name}:")
-    print(f"    Standard spline: DTW = {std_dtw:.4f}, Smoothing = {std_smooth:.4f}")
-    print(f"    Optimized spline: DTW = {opt_dtw:.4f}, Smoothing = {opt_smooth:.4f}")
-    print(f"    Improvement: {improvement:.4f} ({percent_improvement:.2f}%)")
-
-# Convert lists to arrays for consistency with original code
-standard_results['fitted_trajectories'] = np.array(standard_results['fitted_trajectories']).T
-optimized_results['fitted_trajectories'] = np.array(optimized_results['fitted_trajectories']).T
-standard_results['dtw_distances'] = np.array(standard_results['dtw_distances'])
-optimized_results['dtw_distances'] = np.array(optimized_results['dtw_distances'])
-standard_results['smoothing_values'] = np.array(standard_results['smoothing_values'])
-optimized_results['smoothing_values'] = np.array(optimized_results['smoothing_values'])
-
-# Add time points to results
-standard_results['time_points'] = fitter.fine_time_points
-optimized_results['time_points'] = fitter.fine_time_points
-
-# Calculate overall scores
-standard_results['model_score'] = -np.mean(standard_results['dtw_distances'])
-optimized_results['model_score'] = -np.mean(optimized_results['dtw_distances'])
+# Extract results
+standard_results = fitting_results['standard_results']
+optimized_results = fitting_results['optimized_results']
+top_genes_data = fitting_results['top_genes_data']
 
 # Compare results
 print("\nSpline Fitting Results Comparison:")

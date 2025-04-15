@@ -15,7 +15,8 @@ from .cell_interpolation import (
 
 from .trajectory_conservation import (
     calculate_trajectory_conservation,
-    get_most_conserved_samples
+    get_most_conserved_samples,
+    extract_pairwise_distances
 )
 
 from .trajectory_fitter import TrajectoryFitter
@@ -32,13 +33,9 @@ from .trajectory_utils import (
 from .visualization import (
     plot_interpolation_example,
     plot_conservation_scores,
-    plot_sample_similarity,
-    plot_variation_distribution,
     plot_fitted_trajectories,
     plot_clusters,
     plot_model_comparison,
     plot_feature_variation
 )
 
-# Import CLI for entry point usage
-from . import cli

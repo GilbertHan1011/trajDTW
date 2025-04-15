@@ -14,6 +14,9 @@ import pandas as pd
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
+import joblib
+from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 # Import utility functions
 from .trajectory_utils import (
@@ -30,6 +33,107 @@ except ImportError:
     fastdtw = None
     warnings.warn("fastdtw not available. DTW computations will be slower.")
 
+def _process_gene(gene_idx, gene_name, data, n_samples, sample_pairs, 
+                 dtw_radius, normalize, use_fastdtw, 
+                 filter_samples_by_variation, variation_threshold, 
+                 variation_metric, min_valid_samples):
+    """
+    Helper function to process a single gene for parallel computation.
+    
+    Calculates the pairwise DTW distances between samples for a given gene
+    and returns all necessary information for the gene.
+    
+    Returns a tuple with:
+    - gene_idx: Index of the gene
+    - gene_name: Name of the gene
+    - dist_df: DataFrame with pairwise distances
+    - conservation_score: Conservation score for the gene
+    - is_filtered: Whether the gene was filtered
+    - gene_info: Dictionary with sample filtering information
+    """
+    # Initialize distance matrix for this gene
+    dist_matrix = np.zeros((n_samples, n_samples))
+    np.fill_diagonal(dist_matrix, 0)  # Set diagonal to 0 (self-distance)
+    
+    # Store filtering information
+    gene_info = {}
+    
+    # Filter samples by variation if requested
+    if filter_samples_by_variation:
+        # Calculate variation for each sample's trajectory
+        sample_variations = np.array([
+            calculate_trajectory_variation(
+                data[i, :, gene_idx], 
+                metric=variation_metric
+            )
+            for i in range(n_samples)
+        ])
+        
+        # Create mask for samples with sufficient variation
+        valid_samples = sample_variations >= variation_threshold
+        valid_sample_indices = np.where(valid_samples)[0]
+        
+        # Store which samples were included
+        gene_info['sample_indices'] = valid_sample_indices.tolist()
+        gene_info['variations'] = sample_variations.tolist()
+        gene_info['n_valid'] = np.sum(valid_samples)
+        
+        # Skip gene if too few valid samples
+        if len(valid_sample_indices) < min_valid_samples:
+            return gene_idx, gene_name, dist_matrix, None, True, gene_info
+            
+        # Create list of valid sample pairs
+        valid_sample_pairs = [
+            (i, j) for i in valid_sample_indices 
+            for j in valid_sample_indices if i < j
+        ]
+    else:
+        # Use all samples if not filtering
+        valid_sample_pairs = sample_pairs
+        gene_info = {
+            'sample_indices': list(range(n_samples)),
+            'variations': None,  # Not calculated
+            'n_valid': n_samples
+        }
+    
+    # Check if we have any valid pairs
+    n_valid_pairs = len(valid_sample_pairs)
+    if n_valid_pairs == 0:
+        return gene_idx, gene_name, dist_matrix, None, True, gene_info
+        
+    # Calculate distances only for valid sample pairs
+    pair_distances = []
+    for i, j in valid_sample_pairs:
+        # Extract trajectories
+        traj_i = data[i, :, gene_idx]
+        traj_j = data[j, :, gene_idx]
+        
+        # Compute DTW distance using imported utility
+        distance = compute_dtw(traj_i, traj_j, radius=dtw_radius, 
+                              norm_method=normalize, use_fastdtw=use_fastdtw)
+        
+        # Store in the distance matrix
+        dist_matrix[i, j] = distance
+        dist_matrix[j, i] = distance
+        
+        # Add to pair distances for conservation score
+        pair_distances.append(distance)
+    
+    # Convert distance matrix to DataFrame
+    dist_df = pd.DataFrame(
+        dist_matrix,
+        index=[f"Sample_{i}" for i in range(n_samples)],
+        columns=[f"Sample_{i}" for i in range(n_samples)]
+    )
+    
+    # Compute conservation score (negative mean distance)
+    if len(pair_distances) > 0:
+        conservation_score = -np.mean(pair_distances)
+    else:
+        conservation_score = np.nan
+        
+    return gene_idx, gene_name, dist_df, conservation_score, False, gene_info
+
 def calculate_trajectory_conservation(trajectory_data: np.ndarray, 
                                       gene_names: Optional[Union[List[str], np.ndarray]] = None, 
                                       save_dir: Optional[Union[str, Path]] = None, 
@@ -40,7 +144,11 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
                                       filter_samples_by_variation: bool = True,
                                       variation_threshold: float = 0.1,
                                       variation_metric: str = 'max',
-                                      min_valid_samples: int = 2) -> Dict:
+                                      min_valid_samples: int = 2,
+                                      calculate_conserved_samples: bool = True,
+                                      conserved_fraction: float = 0.5,
+                                      n_jobs: int = -1,
+                                      show_progress: bool = True) -> Dict:
     """
     Calculate conservation of trajectories across samples using DTW distance.
     
@@ -73,6 +181,14 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
         Metric to use for variation: 'cv', 'std', 'range', 'max', or 'mad'
     min_valid_samples : int, optional
         Minimum number of valid samples required after filtering (default 2)
+    calculate_conserved_samples : bool, optional
+        Whether to calculate the most conserved samples for each gene (default True)
+    conserved_fraction : float, optional
+        Fraction of samples to select as most conserved (default 0.5)
+    n_jobs : int, optional (default=-1)
+        Number of parallel jobs to run. -1 means using all processors.
+    show_progress : bool, optional (default=True)
+        Whether to show a progress bar during computation.
         
     Returns:
     -------
@@ -81,6 +197,7 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
         - pairwise_distances: Dictionary of dataframes with pairwise DTW distances for each gene
         - conservation_scores: DataFrame with conservation scores for all genes
         - similarity_matrix: Similarity matrix based on pairwise distances
+        - conserved_samples: Dictionary mapping gene names to indices of most conserved samples
         - metadata: Additional information about the calculation
         - filtering_info: Information about which samples were filtered (if filtering enabled)
     """
@@ -96,31 +213,11 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
     if len(shape) != 3:
         raise ValueError(f"Input data must be a 3D array, got shape {shape}")
         
-    # Try to detect the orientation
-    # If we have many more points in axis 1 than axis 2, 
-    # the data might be (sample, pseudotime, gene)
-    if shape[1] > shape[2] * 2:  # Heuristic: pseudotime has at least 2x more points than genes
-        orientation = "sample_time_gene"
-        n_samples, n_timepoints, n_genes = shape
-        
-        # No need to transpose, already in correct format
-        data = trajectory_data
-        
-    # If we have more points in axis 2, it might be (sample, gene, pseudotime)    
-    elif shape[2] > shape[1] * 2:  # Heuristic: pseudotime has at least 2x more points than genes
-        orientation = "sample_gene_time"
-        n_samples, n_genes, n_timepoints = shape
-        
-        # Transpose to get (sample, time, gene)
-        data = np.transpose(trajectory_data, (0, 2, 1))
-        
-    # If the heuristic isn't clear, we'll assume (sample, time, gene)
-    else:
-        orientation = "assumed_sample_time_gene"
-        n_samples, n_timepoints, n_genes = shape
-        data = trajectory_data
-        print(f"Warning: Ambiguous data orientation. Assuming shape is (sample={n_samples}, "
-              f"pseudotime={n_timepoints}, gene={n_genes})")
+
+    n_samples, n_timepoints, n_genes = shape
+    data = trajectory_data
+    print(f"Warning: Ambiguous data orientation. Assuming shape is (sample={n_samples}, "
+            f"pseudotime={n_timepoints}, gene={n_genes})")
     
     # Set up gene names
     if gene_names is None:
@@ -129,115 +226,52 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
         raise ValueError(f"Length of gene_names ({len(gene_names)}) doesn't match "
                          f"number of genes in data ({n_genes})")
 
-    # Initialize results storage
-    pairwise_distances = {}
-    conservation_scores = np.zeros(n_genes)
+    # Create all possible sample pairs once
     sample_pairs = [(i, j) for i in range(n_samples) for j in range(i+1, n_samples)]
     n_pairs = len(sample_pairs)
     
-    print(f"Calculating pairwise DTW distances for {n_genes} genes across {n_samples} samples "
-          f"({n_pairs} pairwise comparisons per gene)...")
-    print(f"Using normalization method: {normalize}")
+    if show_progress:
+        print(f"Calculating pairwise DTW distances for {n_genes} genes across {n_samples} samples "
+              f"({n_pairs} pairwise comparisons per gene)...")
+        print(f"Using normalization method: {normalize}")
+        
+        if filter_samples_by_variation:
+            print(f"Filtering samples by variation: threshold={variation_threshold}, metric={variation_metric}")
     
-    if filter_samples_by_variation:
-        print(f"Filtering samples by variation: threshold={variation_threshold}, metric={variation_metric}")
+    # Determine number of jobs
+    n_jobs = n_jobs if n_jobs > 0 else joblib.cpu_count()
+    actual_n_jobs = min(n_jobs, n_genes)
     
-    # Dictionary to store filtering information
+    if show_progress:
+        print(f"Processing {n_genes} genes using {actual_n_jobs} parallel jobs...")
+
+    # Process all genes in parallel
+    results = Parallel(n_jobs=actual_n_jobs, verbose=1 if show_progress else 0)(
+        delayed(_process_gene)(
+            gene_idx, gene_names[gene_idx], data, n_samples, sample_pairs,
+            dtw_radius, normalize, use_fastdtw,
+            filter_samples_by_variation, variation_threshold, 
+            variation_metric, min_valid_samples
+        )
+        for gene_idx in range(n_genes)
+    )
+    
+    # Initialize storage for results
+    pairwise_distances = {}
+    conservation_scores = np.zeros(n_genes)
     samples_included = {}
     filtered_genes = []
     
-    # Calculate pairwise DTW distances for each gene
-    for gene_idx in range(n_genes):
-        gene_name = gene_names[gene_idx]
-        
-        # Initialize distance matrix for this gene
-        dist_matrix = np.zeros((n_samples, n_samples))
-        np.fill_diagonal(dist_matrix, 0)  # Set diagonal to 0 (self-distance)
-        
-        # Filter samples by variation if requested
-        if filter_samples_by_variation:
-            # Calculate variation for each sample's trajectory
-            sample_variations = np.array([
-                calculate_trajectory_variation(
-                    data[i, :, gene_idx], 
-                    metric=variation_metric
-                )
-                for i in range(n_samples)
-            ])
-            
-            # Create mask for samples with sufficient variation
-            valid_samples = sample_variations >= variation_threshold
-            valid_sample_indices = np.where(valid_samples)[0]
-            
-            # Store which samples were included
-            samples_included[gene_name] = {
-                'sample_indices': valid_sample_indices.tolist(),
-                'variations': sample_variations.tolist(),
-                'n_valid': np.sum(valid_samples)
-            }
-            
-            # Skip gene if too few valid samples
-            if len(valid_sample_indices) < min_valid_samples:
-                filtered_genes.append(gene_name)
-                conservation_scores[gene_idx] = np.nan  # Use NaN for filtered genes
-                continue
-                
-            # Create list of valid sample pairs
-            valid_sample_pairs = [
-                (i, j) for i in valid_sample_indices 
-                for j in valid_sample_indices if i < j
-            ]
-        else:
-            # Use all samples if not filtering
-            valid_sample_pairs = sample_pairs
-            samples_included[gene_name] = {
-                'sample_indices': list(range(n_samples)),
-                'variations': None,  # Not calculated
-                'n_valid': n_samples
-            }
-        
-        # Check if we have any valid pairs
-        n_valid_pairs = len(valid_sample_pairs)
-        if n_valid_pairs == 0:
-            conservation_scores[gene_idx] = np.nan
+    # Process results
+    for gene_idx, gene_name, dist_df, score, is_filtered, gene_info in results:
+        if is_filtered:
             filtered_genes.append(gene_name)
-            continue
-            
-        # Calculate distances only for valid sample pairs
-        pair_distances = []
-        for i, j in valid_sample_pairs:
-            # Extract trajectories
-            traj_i = data[i, :, gene_idx]
-            traj_j = data[j, :, gene_idx]
-            
-            # Compute DTW distance using imported utility
-            distance = compute_dtw(traj_i, traj_j, radius=dtw_radius, 
-                                  norm_method=normalize, use_fastdtw=use_fastdtw)
-            
-            # Store in the distance matrix
-            dist_matrix[i, j] = distance
-            dist_matrix[j, i] = distance
-            
-            # Add to pair distances for conservation score
-            pair_distances.append(distance)
-        
-        # Store as DataFrame
-        dist_df = pd.DataFrame(
-            dist_matrix,
-            index=[f"Sample_{i}" for i in range(n_samples)],
-            columns=[f"Sample_{i}" for i in range(n_samples)]
-        )
-        pairwise_distances[gene_name] = dist_df
-        
-        # Compute conservation score (negative mean distance)
-        if len(pair_distances) > 0:
-            conservation_scores[gene_idx] = -np.mean(pair_distances)
-        else:
             conservation_scores[gene_idx] = np.nan
-            
-        # Print progress
-        if (gene_idx + 1) % 10 == 0 or gene_idx == n_genes - 1:
-            print(f"Processed {gene_idx + 1}/{n_genes} genes")
+        else:
+            pairwise_distances[gene_name] = dist_df
+            conservation_scores[gene_idx] = score
+        
+        samples_included[gene_name] = gene_info
     
     # Handle NaN values (filtered genes)
     non_nan_indices = ~np.isnan(conservation_scores)
@@ -321,9 +355,7 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
         
         # Import visualization functions
         from .visualization import (
-            plot_conservation_scores, 
-            plot_sample_similarity, 
-            plot_variation_distribution
+            plot_conservation_scores
         )
         
         # Plot conservation scores
@@ -335,15 +367,7 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
             variation_threshold=variation_threshold,
             variation_metric=variation_metric
         )
-        
-        # Plot sample similarity
-        plot_sample_similarity(
-            similarity_matrix=overall_similarity,
-            save_dir=save_dir,
-            prefix=prefix,
-            sample_names=[f"Sample_{i}" for i in range(n_samples)]
-        )
-        
+
         # If variation filtering was applied, plot the distribution
         if filter_samples_by_variation:
             # Collect all variations to plot distribution
@@ -352,22 +376,13 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
                 if info.get('variations') is not None:
                     all_variations.extend(info['variations'])
                     
-            if all_variations:
-                plot_variation_distribution(
-                    all_variations=np.array(all_variations),
-                    variation_threshold=variation_threshold,
-                    save_dir=save_dir,
-                    prefix=prefix,
-                    variation_metric=variation_metric
-                )
-    
     # Return results
     results = {
         'pairwise_distances': pairwise_distances,
         'conservation_scores': conservation_df,
         'similarity_matrix': similarity_df,
+        'conserved_samples': get_most_conserved_samples(pairwise_distances, n_samples, conserved_fraction) if calculate_conserved_samples else None,
         'metadata': {
-            'orientation': orientation,
             'n_samples': n_samples,
             'n_genes': n_genes,
             'n_timepoints': n_timepoints,
@@ -377,6 +392,7 @@ def calculate_trajectory_conservation(trajectory_data: np.ndarray,
             'variation_metric': variation_metric if filter_samples_by_variation else None,
             'min_valid_samples': min_valid_samples if filter_samples_by_variation else None,
             'n_filtered_genes': len(filtered_genes) if filter_samples_by_variation else 0,
+            'n_jobs': actual_n_jobs  # Add the number of jobs used
         },
         'filtering_info': {
             'samples_included': samples_included,
@@ -458,3 +474,108 @@ def get_most_conserved_samples(pairwise_distances: Dict, n_samples: int, fractio
             conserved_samples[gene_name] = selected_indices
     
     return conserved_samples 
+
+
+def extract_pairwise_distances(
+    conservation_results: Dict,
+    output_csv: Optional[Union[str, Path]] = None,
+    gene_subset: Optional[List[str]] = None,
+    sample_subset: Optional[List[int]] = None,
+    include_filtered: bool = False
+) -> pd.DataFrame:
+    """
+    Extract pairwise distances from conservation results into a tabular format.
+    
+    Parameters
+    ----------
+    conservation_results : dict
+        Results dictionary from calculate_trajectory_conservation function
+    output_csv : str or Path, optional
+        Path to save CSV file. If None, CSV is not saved.
+    gene_subset : list, optional
+        List of genes to include. If None, all genes are included.
+    sample_subset : list, optional
+        List of sample indices to include. If None, all samples are included.
+    include_filtered : bool, optional
+        Whether to include genes that were filtered during conservation analysis
+    
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns: gene, sample1, sample2, distance
+    """
+    # Verify required data is in conservation results
+    if not isinstance(conservation_results, dict) or 'pairwise_distances' not in conservation_results:
+        raise ValueError("Invalid conservation_results provided. Must be a dictionary with 'pairwise_distances' key.")
+    
+    pairwise_distances = conservation_results['pairwise_distances']
+    
+    # Get filtered genes if needed
+    filtered_genes = []
+    if not include_filtered and 'filtering_info' in conservation_results:
+        filtering_info = conservation_results.get('filtering_info', {})
+        if filtering_info and 'filtered_genes' in filtering_info:
+            filtered_genes = filtering_info['filtered_genes']
+    
+    # Determine which genes to process
+    if gene_subset is not None:
+        # Filter to only include specified genes that also exist in the results
+        genes_to_process = [gene for gene in gene_subset if gene in pairwise_distances]
+    else:
+        # Use all genes
+        genes_to_process = list(pairwise_distances.keys())
+    
+    # Filter out filtered genes if required
+    if not include_filtered:
+        genes_to_process = [gene for gene in genes_to_process if gene not in filtered_genes]
+    
+    # First, create an empty list to store our data
+    rows = []
+    
+    # Loop through each gene and its distance matrix
+    for gene in genes_to_process:
+        distance_matrix = pairwise_distances[gene]
+        
+        # Convert the distance matrix to a DataFrame if it's not already
+        if not isinstance(distance_matrix, pd.DataFrame):
+            distance_matrix = pd.DataFrame(distance_matrix)
+        
+        # Filter samples if sample_subset is provided
+        if sample_subset is not None:
+            # Get valid sample indices that exist in the distance matrix
+            valid_indices = [idx for idx in sample_subset if idx < len(distance_matrix.index)]
+            
+            # If no valid indices after filtering, skip this gene
+            if not valid_indices:
+                continue
+                
+            # Filter the distance matrix to only include specified samples
+            distance_matrix = distance_matrix.iloc[valid_indices, valid_indices]
+        
+        # Extract the sample pairs and their distances (upper triangular part only)
+        for i, row_idx in enumerate(distance_matrix.index):
+            for j, col_idx in enumerate(distance_matrix.columns):
+                if j > i:  # Only upper triangular
+                    sample1 = row_idx
+                    sample2 = col_idx
+                    distance = distance_matrix.iloc[i, j]
+                    
+                    # Add this pair to our list
+                    rows.append({
+                        'gene': gene,
+                        'sample1': sample1,
+                        'sample2': sample2,
+                        'distance': distance
+                    })
+    
+    # Create a DataFrame from the list
+    distance_df = pd.DataFrame(rows)
+    
+    # Save to CSV if output_csv is provided
+    if output_csv is not None:
+        output_path = Path(output_csv) if not isinstance(output_csv, Path) else output_csv
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        distance_df.to_csv(output_path, index=False)
+        print(f"Pairwise distances saved to {output_path}")
+    
+    return distance_df 

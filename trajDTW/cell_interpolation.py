@@ -7,12 +7,15 @@ from typing import List, Dict, Tuple, Union, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.sparse import csr_matrix
+import joblib
+from joblib import Parallel, delayed
 import multiprocessing
 import warnings
 from scipy import sparse
 from scipy.spatial.distance import euclidean
 from pathlib import Path
 import time
+from tqdm.auto import tqdm  # Import tqdm for progress bars
 
 # Try to import fastdtw, but handle it if not available
 try:
@@ -227,14 +230,15 @@ class GaussianTrajectoryInterpolator:
         array-like
             Binned pseudotime values (1 to n_bins)
         """
+        #print(f"Pseudotime: {np.min(pseudotime)}, {np.max(pseudotime)}")
         bins = np.linspace(np.min(pseudotime), np.max(pseudotime), self.n_bins + 1)
         binned = np.digitize(pseudotime, bins) - 1
         binned = np.clip(binned, 0, self.n_bins - 1)  # Ensure values are within range
-        return binned + 1  # 1-based indexing to match R behavior
+        return binned + 1  # 1-based indexing
     
     def filter_batches_by_coverage(self, batch_labels, binned_pseudotime, 
                                   batch_thred=0.3, ensure_tail=True, 
-                                  tail_width=0.3, tail_num=0.02):
+                                  tail_width=0.3, tail_num=0.02, verbose=True):
         """
         Filter batches based on coverage of pseudotime and presence in tail region.
         
@@ -252,6 +256,8 @@ class GaussianTrajectoryInterpolator:
             Width of the tail region (fraction of bins)
         tail_num : float
             Minimum fraction of tail bins that must be covered
+        verbose : bool
+            Whether to print detailed information
             
         Returns
         -------
@@ -274,20 +280,54 @@ class GaussianTrajectoryInterpolator:
             if coverage > batch_thred
         ]
         
-        # If ensure_tail, check for tail coverage
+        if verbose:
+            print(f"Batches after coverage filtering: {qualified_batches}")
+        
+        # If ensure_tail, check for tail coverage using unique bins
         if ensure_tail:
+            # Calculate tail threshold - bins greater than this are in the tail region
             tail_threshold = (1 - tail_width) * self.n_bins
             tail_batches = []
             
+            # Create metadata-like structure for tail analysis
+            # This matches the R implementation's approach
+            metadata = pd.DataFrame({
+                'batch': batch_labels,
+                'pseudotime_binned': binned_pseudotime,
+                'pseudotime_binned_tail': binned_pseudotime > tail_threshold
+            })
+            
+            # Create a unique (batch, bin) dataset
+            unique_metadata = metadata.drop_duplicates(subset=['batch', 'pseudotime_binned'])
+            
+            # Create a contingency table of batch vs. tail status
+            # Count unique bins per batch that are in the tail region
+            contingency_table = pd.crosstab(
+                unique_metadata['batch'], 
+                unique_metadata['pseudotime_binned_tail']
+            )
+            
+            if verbose:
+                print(f"Contingency table of unique bins in tail region:")
+                #print(contingency_table)
+            
+            # Similar to the R code:
+            # return(rownames(selectTable)[selectTable[,2]> tail_num* n_bin])
             for batch in qualified_batches:
-                batch_mask = batch_labels == batch
-                batch_bins = binned_pseudotime[batch_mask]
-                tail_bins = batch_bins[batch_bins > tail_threshold]
-                if len(tail_bins) > tail_num * self.n_bins:
-                    tail_batches.append(batch)
+                if batch in contingency_table.index:
+                    # If True column exists (some bins are in tail) and count exceeds threshold
+                    if True in contingency_table.columns and contingency_table.loc[batch, True] > tail_num * self.n_bins:
+                        tail_batches.append(batch)
+                        if verbose:
+                            print(f"Batch {batch} qualified: {contingency_table.loc[batch, True] if True in contingency_table.columns else 0} tail bins > {tail_num * self.n_bins} threshold")
+                    else:
+                        if verbose:
+                            print(f"Batch {batch} filtered out: {contingency_table.loc[batch, True] if True in contingency_table.columns else 0} tail bins <= {tail_num * self.n_bins} threshold")
                     
             qualified_batches = tail_batches
             
+        if verbose:
+            print(f"Final qualified batches: {qualified_batches}")
         return qualified_batches
     
     def calculate_bin_means(self, expression_matrix, cell_indices, bin_labels, n_bins):
@@ -372,7 +412,8 @@ class GaussianTrajectoryInterpolator:
     
     def anndata_to_3d_matrix(self, adata, pseudo_col, batch_col, 
                            gene_thred=0.1, batch_thred=0.3, 
-                           ensure_tail=True, tail_width=0.3, tail_num=0.02):
+                           ensure_tail=True, tail_width=0.3, tail_num=0.02, 
+                           verbose=True, n_jobs=-1):
         """
         Convert AnnData object to 3D matrix using Gaussian kernel interpolation.
         
@@ -394,6 +435,10 @@ class GaussianTrajectoryInterpolator:
             Width of the tail region (fraction of bins)
         tail_num : float
             Minimum fraction of tail bins that must be covered
+        verbose : bool
+            Whether to print progress information
+        n_jobs : int, optional
+            Number of parallel jobs to run. -1 means using all processors.
             
         Returns
         -------
@@ -427,16 +472,35 @@ class GaussianTrajectoryInterpolator:
         bin_to_idx = {bin_name: idx for idx, bin_name in enumerate(unique_bins)}
         cell_bin_indices = np.array([bin_to_idx[bin_name] for bin_name in metadata['bin']])
         
-        # First just create a simple binned mean matrix for filtering
-        binned_means = np.zeros((expression_matrix.shape[0], len(unique_bins)))
-        for bin_idx in range(len(unique_bins)):
+        # Define the helper function for parallel bin mean calculation
+        def _process_bin(bin_idx):
             bin_mask = cell_bin_indices == bin_idx
             if np.sum(bin_mask) > 0:
                 if scipy.sparse.issparse(expression_matrix):
                     bin_expr = expression_matrix[:, bin_mask].toarray()
                 else:
                     bin_expr = expression_matrix[:, bin_mask]
-                binned_means[:, bin_idx] = np.mean(bin_expr, axis=1)
+                return np.mean(bin_expr, axis=1)
+            return np.zeros(expression_matrix.shape[0])
+        
+        # First just create a simple binned mean matrix for filtering - using parallel processing
+        if verbose:
+            print("Calculating bin means in parallel...")
+            
+        # Use joblib for parallel bin mean calculation
+        n_jobs = n_jobs if n_jobs > 0 else joblib.cpu_count()
+        actual_n_jobs = min(n_jobs, len(unique_bins))
+        
+        binned_means = np.zeros((expression_matrix.shape[0], len(unique_bins)))
+        
+        # Use progress_bar=True if verbose for joblib feedback
+        bin_means_results = Parallel(n_jobs=actual_n_jobs, verbose=1 if verbose else 0)(
+            delayed(_process_bin)(bin_idx) for bin_idx in range(len(unique_bins))
+        )
+        
+        # Convert results to array
+        for bin_idx, bin_mean in enumerate(bin_means_results):
+            binned_means[:, bin_idx] = bin_mean
         
         # Filter genes
         gene_expressed = (binned_means > 0).sum(axis=1)
@@ -444,10 +508,13 @@ class GaussianTrajectoryInterpolator:
         filtered_gene_indices = np.where(gene_expressed > gene_threshold)[0]
         filtered_genes = np.array(adata.var_names)[filtered_gene_indices]
         
+        if verbose:
+            print(f"Filtered to {len(filtered_genes)} genes that meet expression threshold")
+        
         # Filter batches
         batch_names = self.filter_batches_by_coverage(
             batch_labels, binned_pseudotime, batch_thred, 
-            ensure_tail, tail_width, tail_num
+            ensure_tail, tail_width, tail_num, verbose
         )
         
         # Set up Gaussian kernel interpolation
@@ -461,6 +528,9 @@ class GaussianTrajectoryInterpolator:
         max_time = np.max(sorted_pseudotime)
         normalized_pseudotime = (sorted_pseudotime - min_time) / (max_time - min_time)
         
+        if verbose:
+            print("Computing Gaussian kernel weights...")
+            
         # Compute Gaussian kernel weights
         abs_timediff_mat = self.compute_abs_timediff_mat(normalized_pseudotime)
         
@@ -480,33 +550,56 @@ class GaussianTrajectoryInterpolator:
         # Initialize 3D array
         result_3d = np.zeros((len(batch_names), self.n_bins, len(filtered_genes)))
         
-        # For each batch, interpolate gene expression
-        for batch_idx, batch in enumerate(batch_names):
-            batch_mask = sorted_batch_labels == batch
-            if np.sum(batch_mask) > 0:
-                batch_pseudotime = normalized_pseudotime[batch_mask]
-                batch_weights = weight_matrix[:, batch_mask]
-                
-                # For each gene, calculate interpolated values
-                for gene_idx in range(len(filtered_genes)):
-                    if scipy.sparse.issparse(expression_matrix):
-                        gene_expr = expression_matrix[filtered_gene_indices[gene_idx], sort_idx].toarray().flatten()
-                    else:
-                        gene_expr = expression_matrix[filtered_gene_indices[gene_idx], sort_idx]
-                        
-                    batch_gene_expr = gene_expr[batch_mask]
-                    
-                    if np.all(batch_gene_expr == 0):
-                        # If gene not expressed in this batch, skip
-                        continue
-                        
-                    interpolated_means, interpolated_stds = self.interpolate_gene_expression(
-                        batch_gene_expr, batch_weights
-                    )
-                    
-                    # Store interpolated means in 3D array
-                    result_3d[batch_idx, :, gene_idx] = interpolated_means
+        if verbose:
+            print(f"Interpolating gene expression for {len(batch_names)} batches and {len(filtered_genes)} genes using {actual_n_jobs} parallel jobs...")
         
+        # Define the helper function for parallel gene interpolation
+        def _process_gene_batch(batch_idx, gene_idx):
+            batch = batch_names[batch_idx]
+            batch_mask = sorted_batch_labels == batch
+            
+            # Skip if no cells in this batch
+            if not np.any(batch_mask):
+                return batch_idx, gene_idx, None
+            
+            batch_weights = weight_matrix[:, batch_mask]
+            gene_expr = filtered_expression[gene_idx, sort_idx]
+            batch_gene_expr = gene_expr[batch_mask]
+            
+            # Skip if gene not expressed in this batch
+            if np.all(batch_gene_expr == 0):
+                return batch_idx, gene_idx, None
+            
+            # Calculate interpolated values
+            interpolated_means, _ = self.interpolate_gene_expression(
+                batch_gene_expr, batch_weights
+            )
+            
+            return batch_idx, gene_idx, interpolated_means
+        
+        # Create list of all (batch_idx, gene_idx) pairs
+        tasks = []
+        for batch_idx in range(len(batch_names)):
+            batch = batch_names[batch_idx]
+            batch_mask = sorted_batch_labels == batch
+            if np.sum(batch_mask) > 0:  # Only include batch if it has cells
+                for gene_idx in range(len(filtered_genes)):
+                    tasks.append((batch_idx, gene_idx))
+        
+        # Process all gene-batch pairs in parallel
+        results = Parallel(n_jobs=actual_n_jobs, verbose=1 if verbose else 0)(
+            delayed(_process_gene_batch)(batch_idx, gene_idx) 
+            for batch_idx, gene_idx in tasks
+        )
+        
+        # Update the 3D array with results
+        for batch_idx, gene_idx, interpolated_means in results:
+            if interpolated_means is not None:
+                result_3d[batch_idx, :, gene_idx] = interpolated_means
+        
+        if verbose:
+            print(f"Interpolation complete. 3D matrix shape: {result_3d.shape}")
+            
         # Return results
         return {
             'reshaped_data': result_3d,
@@ -550,7 +643,8 @@ class GaussianTrajectoryInterpolator:
 def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100, 
                          adaptive_kernel=True, kernel_window_size=0.1, 
                          gene_thred=0.1, batch_thred=0.3, 
-                         ensure_tail=True, tail_width=0.3, tail_num=0.02):
+                         ensure_tail=True, tail_width=0.3, tail_num=0.02, 
+                         verbose=True, n_jobs=-1):
     """
     Convert AnnData object to 3D matrix using Gaussian kernel interpolation.
     
@@ -578,6 +672,10 @@ def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100,
         Width of the tail region (fraction of bins)
     tail_num : float
         Minimum fraction of tail bins that must be covered
+    verbose : bool
+        Whether to show progress bars and additional information during processing
+    n_jobs : int, optional
+        Number of parallel jobs to run. -1 means using all processors.
         
     Returns
     -------
@@ -603,7 +701,9 @@ def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100,
         batch_thred=batch_thred,
         ensure_tail=ensure_tail,
         tail_width=tail_width,
-        tail_num=tail_num
+        tail_num=tail_num,
+        verbose=verbose,
+        n_jobs=n_jobs
     )
 
 def visualize_fitting_results(standard_results, optimized_results, top_genes_data, 
@@ -736,9 +836,93 @@ def create_fitting_summary(standard_results, optimized_results, top_gene_names,
     
     return str(output_file)
 
-def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, time_points, 
-                              top_n_genes=10, n_jobs=4, verbose=True, interpolation_factor=2,
-                              model_type='spline', spline_degree=3, spline_smoothing=0.5):
+def _process_single_gene(i, gene_name, gene_data, fitter, model_type, 
+                         spline_degree, spline_smoothing,
+                        use_dtw_optimization, n_jobs_per_gene=1):
+    """
+    Helper function to process a single gene with both standard and optional DTW-optimized fitting.
+    
+    Parameters:
+    -----------
+    i : int
+        Index of the gene
+    gene_name : str
+        Name of the gene
+    gene_data : numpy.ndarray
+        Data for this gene with shape (n_samples, n_timepoints, 1)
+    fitter : TrajectoryFitter
+        Initialized TrajectoryFitter object
+    model_type : str
+        Type of model to fit
+    spline_degree : int
+        Degree of spline to fit
+    spline_smoothing : float
+        Smoothing factor for spline fitting
+    use_dtw_optimization : bool
+        Whether to perform DTW optimization
+    n_jobs_per_gene : int
+        Number of jobs to use for fitting this gene
+        
+    Returns:
+    --------
+    dict
+        Results for this gene including standard and optimized fits
+    """
+    # Set fitter's n_jobs for this gene
+    fitter.n_jobs = n_jobs_per_gene
+    
+    # Fit standard spline model
+    gene_standard_results = fitter.fit(
+        gene_data,
+        model_type=model_type,
+        spline_degree=spline_degree,
+        spline_smoothing=spline_smoothing,
+        optimize_spline_dtw=False,
+        #verbose=False  # Disable verbose in worker
+    )
+    
+    # Fit DTW-optimized model if requested
+    if use_dtw_optimization:
+        gene_optimized_results = fitter.fit(
+            gene_data,
+            model_type=model_type,
+            spline_degree=spline_degree,
+            spline_smoothing=spline_smoothing,  # Initial value, will be optimized
+            optimize_spline_dtw=True,
+            #verbose=False  # Disable verbose in worker
+        )
+    else:
+        # Create placeholder results with same structure as standard results
+        gene_optimized_results = {
+            'fitted_params': gene_standard_results['fitted_params'],
+            'fitted_trajectories': gene_standard_results['fitted_trajectories'],
+            'dtw_distances': gene_standard_results['dtw_distances'],
+            'smoothing_values': gene_standard_results['smoothing_values']
+        }
+    
+    # Return all results for this gene
+    return {
+        'gene_idx': i,
+        'gene_name': gene_name,
+        'standard_results': {
+            'fitted_params': gene_standard_results['fitted_params'][0],
+            'fitted_trajectory': gene_standard_results['fitted_trajectories'][:, 0],
+            'dtw_distance': gene_standard_results['dtw_distances'][0],
+            'smoothing_value': gene_standard_results['smoothing_values'][0]
+        },
+        'optimized_results': {
+            'fitted_params': gene_optimized_results['fitted_params'][0],
+            'fitted_trajectory': gene_optimized_results['fitted_trajectories'][:, 0],
+            'dtw_distance': gene_optimized_results['dtw_distances'][0],
+            'smoothing_value': gene_optimized_results['smoothing_values'][0]
+        }
+    }
+
+def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, time_points=None, 
+                              top_n_genes=None, n_jobs=-1, verbose=False,
+                              interpolation_factor=1,
+                              model_type='spline', spline_degree=3, spline_smoothing=2,
+                              use_dtw_optimization=True):
     """
     Fit trajectory models using only the most conserved samples for each gene.
     
@@ -754,32 +938,38 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
     conserved_samples : dict
         Dictionary mapping gene names to indices of most conserved samples
         (output from get_most_conserved_samples)
-    time_points : numpy.ndarray
-        Time points for fitting
-    top_n_genes : int, optional (default=10)
-        Number of top genes to fit
-    n_jobs : int, optional (default=4)
-        Number of parallel jobs for TrajectoryFitter
-    verbose : bool, optional (default=True)
-        Whether to print progress
-    interpolation_factor : int, optional (default=2)
+    time_points : numpy.ndarray, optional (default=None)
+        Time points for fitting. If None, evenly spaced points from 0 to 1 will be used.
+    top_n_genes : int or None, optional (default=None)
+        Number of top genes to fit. If None, all genes will be fitted.
+    n_jobs : int, optional (default=1)
+        Number of parallel jobs for processing genes. If -1, all available cores are used.
+    verbose : bool, optional (default=False)
+        Whether to show progress bar and additional information
+    interpolation_factor : int, optional (default=1)
         Interpolation factor for TrajectoryFitter
     model_type : str, optional (default='spline')
         Type of model to fit
     spline_degree : int, optional (default=3)
         Degree of spline to fit
-    spline_smoothing : float, optional (default=0.5)
+    spline_smoothing : float, optional (default=2)
         Smoothing factor for spline fitting
+    use_dtw_optimization : bool, optional (default=True)
+        Whether to perform DTW optimization. If False, only standard fitting is performed.
         
     Returns:
     --------
     dict
         Dictionary containing:
         - standard_results: Results from standard fitting
-        - optimized_results: Results from DTW-optimized fitting
+        - optimized_results: Results from DTW-optimized fitting (same as standard if use_dtw_optimization=False)
         - top_gene_names: Names of fitted genes
         - top_genes_data: List of specialized datasets for each gene
     """
+    # If time_points is not provided, create evenly spaced points from 0 to 1
+    if time_points is None:
+        time_points = np.linspace(0, 1, reshaped_data.shape[1])
+        
     try:
         from .trajectory_fitter import TrajectoryFitter
     except ImportError:
@@ -794,17 +984,28 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
     # Select top genes if gene_names is a pandas DataFrame with 'normalized_score' column
     # (e.g., from conservation_scores output)
     if hasattr(gene_names, 'head') and 'normalized_score' in gene_names.columns:
-        if 'was_filtered' in gene_names.columns:
-            top_gene_df = gene_names[~gene_names['was_filtered']].head(top_n_genes)
+        # If top_n_genes is None, use all genes (that aren't filtered)
+        if top_n_genes is None:
+            if 'was_filtered' in gene_names.columns:
+                top_gene_df = gene_names[~gene_names['was_filtered']]
+            else:
+                top_gene_df = gene_names
         else:
-            top_gene_df = gene_names.head(top_n_genes)
+            # Otherwise, use the top N genes
+            if 'was_filtered' in gene_names.columns:
+                top_gene_df = gene_names[~gene_names['was_filtered']].head(top_n_genes)
+            else:
+                top_gene_df = gene_names.head(top_n_genes)
         top_gene_names = top_gene_df['gene'].tolist()
     else:
-        # If gene_names is a list or array, just take the first top_n_genes
-        top_gene_names = gene_names[:top_n_genes]
+        # If gene_names is a list or array, use all genes if top_n_genes is None
+        if top_n_genes is None:
+            top_gene_names = gene_names
+        else:
+            # Otherwise, take the first top_n_genes
+            top_gene_names = gene_names[:top_n_genes]
     
     # Find indices in the data array for the selected genes
-    
     all_gene_names = gene_names if isinstance(gene_names, (list, np.ndarray)) else gene_names['gene'].values
     top_gene_positions = [np.where(np.array(all_gene_names) == gene)[0][0] for gene in top_gene_names]
     
@@ -812,7 +1013,7 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
     top_genes_data = []
     
     if verbose:
-        print("Creating specialized datasets for each gene:")
+        print("Creating specialized datasets for each gene...")
     
     for i, gene_name in enumerate(top_gene_names):
         gene_pos = top_gene_positions[i]
@@ -829,7 +1030,8 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
             gene_data = gene_data.reshape(n_cons_samples, reshaped_data.shape[1], 1)
             
             if verbose:
-                print(f"  Gene {gene_name}: Using {n_cons_samples} most conserved samples out of {n_samples} total")
+                if i == 0 or (i+1) % max(1, len(top_gene_names)//5) == 0:  # Print only for a subset of genes
+                    print(f"  Gene {gene_name}: Using {n_cons_samples} most conserved samples out of {n_samples} total")
         else:
             # Fallback if gene not in conserved_samples
             if verbose:
@@ -842,10 +1044,11 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
     if verbose:
         print("Initializing TrajectoryFitter...")
     
+    # Initialize with n_jobs=1 since we'll parallelize at the gene level
     fitter = TrajectoryFitter(
         time_points=time_points,
-        n_jobs=n_jobs,
-        verbose=verbose,
+        n_jobs=1,  # Will be set in the worker for each gene
+        verbose=False,  # Disable verbose in the fitter
         interpolation_factor=interpolation_factor
     )
     
@@ -864,65 +1067,43 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
         'smoothing_values': []
     }
     
-    # Process each gene separately with its own optimized dataset
-    if verbose:
-        print("\nProcessing each gene with its most conserved samples...")
+    # Determine number of jobs to use
+    if n_jobs <= 0:
+        n_jobs = joblib.cpu_count()
+    actual_n_jobs = min(n_jobs, len(top_gene_names))
     
-    for i, gene_name in enumerate(top_gene_names):
-        if verbose:
-            print(f"\nProcessing gene {i+1}/{len(top_gene_names)}: {gene_name}")
-        
-        # Get data for this gene
-        gene_data = top_genes_data[i]
-        
-        # Fit standard spline model for this gene
-        if verbose:
-            print(f"  Fitting standard spline model...")
-        
-        gene_standard_results = fitter.fit(
-            gene_data,
-            model_type=model_type,
-            spline_degree=spline_degree,
-            spline_smoothing=spline_smoothing,
-            optimize_spline_dtw=False
+    # Calculate jobs per gene if processing one gene at a time
+    n_jobs_per_gene = max(1, n_jobs // len(top_gene_names)) if len(top_gene_names) < n_jobs else 1
+    
+    if verbose:
+        print(f"\nProcessing {len(top_gene_names)} genes with {actual_n_jobs} parallel jobs...")
+        if not use_dtw_optimization:
+            print("DTW optimization is disabled - only standard fitting will be performed")
+    
+    # Process genes in parallel with progress bar
+    with tqdm(total=len(top_gene_names), disable=not verbose, desc="Processing genes") as pbar:
+        # Run parallel processing
+        results = Parallel(n_jobs=actual_n_jobs, verbose=0)(
+            delayed(_process_single_gene)(
+                i, gene_name, top_genes_data[i], fitter, 
+                model_type, spline_degree, spline_smoothing, 
+                use_dtw_optimization, n_jobs_per_gene
+            ) for i, gene_name in enumerate(top_gene_names)
         )
         
-        # Fit DTW-optimized spline model for this gene
-        if verbose:
-            print(f"  Fitting DTW-optimized spline model...")
+    # Process results
+    for result in results:
+        # Extract standard results
+        standard_results['fitted_params'].append(result['standard_results']['fitted_params'])
+        standard_results['fitted_trajectories'].append(result['standard_results']['fitted_trajectory'])
+        standard_results['dtw_distances'].append(result['standard_results']['dtw_distance'])
+        standard_results['smoothing_values'].append(result['standard_results']['smoothing_value'])
         
-        gene_optimized_results = fitter.fit(
-            gene_data,
-            model_type=model_type,
-            spline_degree=spline_degree,
-            spline_smoothing=spline_smoothing,  # Initial value, will be optimized
-            optimize_spline_dtw=True
-        )
-        
-        # Store results
-        standard_results['fitted_params'].append(gene_standard_results['fitted_params'][0])
-        standard_results['fitted_trajectories'].append(gene_standard_results['fitted_trajectories'][:, 0])
-        standard_results['dtw_distances'].append(gene_standard_results['dtw_distances'][0])
-        standard_results['smoothing_values'].append(gene_standard_results['smoothing_values'][0])
-        
-        optimized_results['fitted_params'].append(gene_optimized_results['fitted_params'][0])
-        optimized_results['fitted_trajectories'].append(gene_optimized_results['fitted_trajectories'][:, 0])
-        optimized_results['dtw_distances'].append(gene_optimized_results['dtw_distances'][0])
-        optimized_results['smoothing_values'].append(gene_optimized_results['smoothing_values'][0])
-        
-        # Print comparison for this gene if verbose
-        if verbose:
-            std_dtw = gene_standard_results['dtw_distances'][0]
-            opt_dtw = gene_optimized_results['dtw_distances'][0]
-            improvement = std_dtw - opt_dtw
-            percent_improvement = 100 * improvement / std_dtw if std_dtw > 0 else 0
-            std_smooth = gene_standard_results['smoothing_values'][0]
-            opt_smooth = gene_optimized_results['smoothing_values'][0]
-            
-            print(f"  Results for {gene_name}:")
-            print(f"    Standard spline: DTW = {std_dtw:.4f}, Smoothing = {std_smooth:.4f}")
-            print(f"    Optimized spline: DTW = {opt_dtw:.4f}, Smoothing = {opt_smooth:.4f}")
-            print(f"    Improvement: {improvement:.4f} ({percent_improvement:.2f}%)")
+        # Extract optimized results
+        optimized_results['fitted_params'].append(result['optimized_results']['fitted_params'])
+        optimized_results['fitted_trajectories'].append(result['optimized_results']['fitted_trajectory'])
+        optimized_results['dtw_distances'].append(result['optimized_results']['dtw_distance'])
+        optimized_results['smoothing_values'].append(result['optimized_results']['smoothing_value'])
     
     # Convert lists to arrays for consistency
     standard_results['fitted_trajectories'] = np.array(standard_results['fitted_trajectories']).T
@@ -940,20 +1121,14 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
     standard_results['model_score'] = -np.mean(standard_results['dtw_distances'])
     optimized_results['model_score'] = -np.mean(optimized_results['dtw_distances'])
     
-    # Add model_score as negative mean of dtw_distances (matching build_matrix.py)
-    if 'model_score' not in standard_results:
-        standard_results['model_score'] = -np.mean(standard_results['dtw_distances'])
-    if 'model_score' not in optimized_results:
-        optimized_results['model_score'] = -np.mean(optimized_results['dtw_distances'])
-        
     # Add mean_dtw_distance for compatibility with example_pipeline.py
     standard_results['mean_dtw_distance'] = np.mean(standard_results['dtw_distances'])
     optimized_results['mean_dtw_distance'] = np.mean(optimized_results['dtw_distances'])
     
-    # Print overall comparison if verbose
-    if verbose:
+    # Print overall comparison if verbose and DTW optimization was performed
+    if verbose and use_dtw_optimization:
         improvement = ((-standard_results['model_score']) - (-optimized_results['model_score']))
-        percent_improvement = 100 * improvement / (-standard_results['model_score'])
+        percent_improvement = 100 * improvement / (-standard_results['model_score']) if -standard_results['model_score'] != 0 else 0
         
         print("\nSpline Fitting Results Comparison:")
         print(f"Standard approach - mean DTW distance: {-standard_results['model_score']:.4f}")
@@ -971,7 +1146,7 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
 
 def run_conserved_sample_fitting_pipeline(adata, batch_key, time_key, n_jobs=4, 
                                         output_dir=None, top_n_genes=20, 
-                                        conserved_fraction=0.5, interpolation_factor=2,
+                                        conserved_fraction=0.5, interpolation_factor=1,
                                         spline_degree=3, spline_smoothing=0.5, 
                                         model_type='spline', verbose=True,
                                         max_genes_to_plot=10):
@@ -1270,14 +1445,14 @@ def run_conserved_sample_fitting_pipeline(adata, batch_key, time_key, n_jobs=4,
             reshaped_data=reshaped_data,  # Pass full reshaped data
             gene_names=top_gene_names,    # Pass all filtered genes
             conserved_samples=conserved_samples,  # Pass conserved samples dict
-            time_points=time_points,      # Pass time points array
             top_n_genes=len(top_gene_names),  # Pass actual number of top genes
             n_jobs=n_jobs,
             verbose=verbose,
             interpolation_factor=interpolation_factor,
             model_type=model_type,
             spline_degree=spline_degree,
-            spline_smoothing=spline_smoothing
+            spline_smoothing=spline_smoothing,
+            use_dtw_optimization=True
         )
         
         standard_results = fitting_results['standard_results']
@@ -1306,7 +1481,7 @@ def run_conserved_sample_fitting_pipeline(adata, batch_key, time_key, n_jobs=4,
             optimized_results=optimized_results,
             top_genes_data=top_genes_data,
             top_gene_names=top_gene_names,
-            time_points=time_points,
+            time_points=standard_results['time_points'],  # Use time_points from the fitting results
             output_dir=output_dir,
             max_genes_to_plot=max_genes_to_plot
         )
