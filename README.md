@@ -1,12 +1,10 @@
 # trajDTW
 
-A Python package for trajectory analysis and dynamic time warping for cell trajectories.
+A Python package for trajectory conservation analysis and dynamic time warping for cell trajectories.
 
 ## Installation
 
-```bash
-pip install trajDTW
-```
+
 
 For development installation:
 
