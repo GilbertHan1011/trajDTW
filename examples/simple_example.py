@@ -14,7 +14,8 @@ import os
 from trajDTW import (
     anndata_to_3d_matrix, 
     calculate_trajectory_conservation,
-    TrajectoryFitter
+    TrajectoryFitter,
+    run_trajectory_conservation_analysis
 )
 
 # Set output directory
@@ -27,6 +28,7 @@ print("\n=== Simple trajDTW Example ===\n")
 adata_path = "../data/example_data.h5ad"
 
 if os.path.exists(adata_path):
+    print("\n=== METHOD 1: Step-by-step approach ===\n")
     # Load AnnData
     print("Loading AnnData...")
     adata = sc.read_h5ad(adata_path)
@@ -97,7 +99,54 @@ if os.path.exists(adata_path):
         
         print(f"  DTW distance: {np.mean(results['dtw_distances']):.4f}")
     
+    print("\n=== METHOD 2: All-in-one approach with run_trajectory_conservation_analysis ===\n")
+    # Create a different output directory for the all-in-one approach
+    one_step_dir = output_dir / "one_step_results"
+    one_step_dir.mkdir(exist_ok=True)
+    
+    print(f"Running the full pipeline analysis using run_trajectory_conservation_analysis...")
+    print(f"Results will be saved to: {one_step_dir}")
+    
+    # Run the complete pipeline analysis
+    results = run_trajectory_conservation_analysis(
+        adata_path=adata_path,
+        output_dir=one_step_dir,
+        pseudo_col='pseudotime',
+        batch_col='sample',
+        n_bins=100,
+        adaptive_kernel=True,
+        gene_thred=0.1,
+        batch_thred=0.3,
+        top_n_genes=10,
+        spline_smoothing=0.5,
+        n_jobs=4,
+        save_figures=True
+    )
+    
+    # Access and display the results
+    print("\nAll-in-one pipeline results:")
+    print(f"Number of filtered genes: {len(results['filtered_genes'])}")
+    print(f"Number of selected top genes: {len(results['selected_genes'])}")
+    
+    # Print top conserved genes
+    print("\nTop 10 most conserved genes from full pipeline:")
+    print(results['conservation_results']['conservation_scores'].head(10))
+    
+    # Print spline fitting performance
+    standard_results = results['fit_results']['standard_results']
+    optimized_results = results['fit_results']['optimized_results']
+    
+    print("\nSpline Fitting Results Comparison:")
+    print(f"Standard approach - mean DTW distance: {standard_results['mean_dtw_distance']:.4f}")
+    print(f"DTW-optimized approach - mean DTW distance: {optimized_results['mean_dtw_distance']:.4f}")
+    
+    improvement = standard_results['mean_dtw_distance'] - optimized_results['mean_dtw_distance']
+    percent_improvement = 100 * improvement / standard_results['mean_dtw_distance']
+    print(f"Improvement: {improvement:.4f}")
+    print(f"Percentage improvement: {percent_improvement:.2f}%")
+    
     print("\nExample completed successfully!")
+    print(f"Various plots and results files saved to: {one_step_dir}")
     
 else:
     print(f"Error: Could not find example data at {adata_path}")

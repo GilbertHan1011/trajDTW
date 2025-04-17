@@ -413,7 +413,7 @@ class GaussianTrajectoryInterpolator:
     def anndata_to_3d_matrix(self, adata, pseudo_col, batch_col, 
                            gene_thred=0.1, batch_thred=0.3, 
                            ensure_tail=True, tail_width=0.3, tail_num=0.02, 
-                           verbose=True, n_jobs=-1):
+                           verbose=True, n_jobs=-1, layer=None):
         """
         Convert AnnData object to 3D matrix using Gaussian kernel interpolation.
         
@@ -439,6 +439,8 @@ class GaussianTrajectoryInterpolator:
             Whether to print progress information
         n_jobs : int, optional
             Number of parallel jobs to run. -1 means using all processors.
+        layer : str, optional
+            If provided, use this layer in AnnData object instead of .X
             
         Returns
         -------
@@ -451,10 +453,18 @@ class GaussianTrajectoryInterpolator:
             - metadata: DataFrame with metadata
         """
         # Extract data
-        if scipy.sparse.issparse(adata.X):
-            expression_matrix = adata.X.T.tocsr()  # genes x cells
+        if layer is None:
+            # Use default expression matrix (X)
+            if scipy.sparse.issparse(adata.X):
+                expression_matrix = adata.X.T.tocsr()  # genes x cells
+            else:
+                expression_matrix = adata.X.T  # genes x cells
         else:
-            expression_matrix = adata.X.T  # genes x cells
+            # Use specified layer
+            if scipy.sparse.issparse(adata.layers[layer]):
+                expression_matrix = adata.layers[layer].T.tocsr()  # genes x cells
+            else:
+                expression_matrix = adata.layers[layer].T  # genes x cells
             
         pseudotime = np.array(adata.obs[pseudo_col])
         batch_labels = np.array(adata.obs[batch_col])
@@ -644,7 +654,7 @@ def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100,
                          adaptive_kernel=True, kernel_window_size=0.1, 
                          gene_thred=0.1, batch_thred=0.3, 
                          ensure_tail=True, tail_width=0.3, tail_num=0.02, 
-                         verbose=True, n_jobs=-1):
+                         verbose=True, n_jobs=-1, layer=None):
     """
     Convert AnnData object to 3D matrix using Gaussian kernel interpolation.
     
@@ -676,6 +686,8 @@ def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100,
         Whether to show progress bars and additional information during processing
     n_jobs : int, optional
         Number of parallel jobs to run. -1 means using all processors.
+    layer : str, optional
+        If provided, use this layer in AnnData object instead of .X
         
     Returns
     -------
@@ -703,7 +715,8 @@ def anndata_to_3d_matrix(adata, pseudo_col, batch_col, n_bins=100,
         tail_width=tail_width,
         tail_num=tail_num,
         verbose=verbose,
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        layer=layer
     )
 
 def visualize_fitting_results(standard_results, optimized_results, top_genes_data, 
@@ -920,7 +933,7 @@ def _process_single_gene(i, gene_name, gene_data, fitter, model_type,
 
 def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, time_points=None, 
                               top_n_genes=None, n_jobs=-1, verbose=False,
-                              interpolation_factor=1,
+                              interpolation_factor=1, gene_positions=None,
                               model_type='spline', spline_degree=3, spline_smoothing=2,
                               use_dtw_optimization=True):
     """
@@ -948,6 +961,11 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
         Whether to show progress bar and additional information
     interpolation_factor : int, optional (default=1)
         Interpolation factor for TrajectoryFitter
+    gene_positions : dict or list, optional (default=None)
+        Mapping of gene names to their position indices in reshaped_data's third dimension.
+        If a dict, keys are gene names and values are their positions.
+        If a list, should be the same length as gene_names, containing corresponding position indices.
+        If None, positions will be determined by searching gene_names in all_gene_names.
     model_type : str, optional (default='spline')
         Type of model to fit
     spline_degree : int, optional (default=3)
@@ -1005,9 +1023,44 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
             # Otherwise, take the first top_n_genes
             top_gene_names = gene_names[:top_n_genes]
     
-    # Find indices in the data array for the selected genes
-    all_gene_names = gene_names if isinstance(gene_names, (list, np.ndarray)) else gene_names['gene'].values
-    top_gene_positions = [np.where(np.array(all_gene_names) == gene)[0][0] for gene in top_gene_names]
+    # Determine gene positions based on input parameters
+    if gene_positions is not None:
+        # If gene_positions is a dict, get positions directly from it
+        if isinstance(gene_positions, dict):
+            top_gene_positions = []
+            for gene in top_gene_names:
+                if gene in gene_positions:
+                    pos = gene_positions[gene]
+                    # Validate position is within range
+                    if pos < 0 or pos >= reshaped_data.shape[2]:
+                        raise ValueError(f"Position {pos} for gene {gene} is out of range (0-{reshaped_data.shape[2]-1})")
+                    top_gene_positions.append(pos)
+                else:
+                    raise ValueError(f"Gene {gene} not found in gene_positions dictionary")
+        # If gene_positions is a list or array, use it directly
+        elif isinstance(gene_positions, (list, np.ndarray)):
+            # Verify it has enough elements
+            if len(gene_positions) < len(top_gene_names):
+                raise ValueError(f"gene_positions has {len(gene_positions)} elements but {len(top_gene_names)} genes were selected")
+            top_gene_positions = gene_positions[:len(top_gene_names)]
+            # Validate positions are within range
+            for i, pos in enumerate(top_gene_positions):
+                if pos < 0 or pos >= reshaped_data.shape[2]:
+                    raise ValueError(f"Position {pos} for gene {top_gene_names[i]} is out of range (0-{reshaped_data.shape[2]-1})")
+        else:
+            raise ValueError("gene_positions must be a dict or list-like")
+    else:
+        # Use traditional lookup method if gene_positions not provided
+        if verbose:
+            print("No gene_positions provided. Finding positions by searching in gene_names...")
+        all_gene_names = gene_names if isinstance(gene_names, (list, np.ndarray)) else gene_names['gene'].values
+        top_gene_positions = []
+        for gene in top_gene_names:
+            matches = np.where(np.array(all_gene_names) == gene)[0]
+            if len(matches) > 0:
+                top_gene_positions.append(matches[0])
+            else:
+                raise ValueError(f"Gene {gene} not found in all_gene_names")
     
     # Create a specialized dataset for each gene, using only its most conserved samples
     top_genes_data = []
@@ -1031,11 +1084,11 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
             
             if verbose:
                 if i == 0 or (i+1) % max(1, len(top_gene_names)//5) == 0:  # Print only for a subset of genes
-                    print(f"  Gene {gene_name}: Using {n_cons_samples} most conserved samples out of {n_samples} total")
+                    print(f"  Gene {gene_name}: Using {n_cons_samples} most conserved samples out of {n_samples} total (position: {gene_pos})")
         else:
             # Fallback if gene not in conserved_samples
             if verbose:
-                print(f"  Gene {gene_name}: Using all samples (gene not found in conserved samples dict)")
+                print(f"  Gene {gene_name}: Using all samples (gene not found in conserved samples dict) (position: {gene_pos})")
             gene_data = reshaped_data[:, :, gene_pos:gene_pos+1]
         
         top_genes_data.append(gene_data)
@@ -1144,392 +1197,395 @@ def fit_with_conserved_samples(reshaped_data, gene_names, conserved_samples, tim
         'top_genes_data': top_genes_data
     }
 
-def run_conserved_sample_fitting_pipeline(adata, batch_key, time_key, n_jobs=4, 
-                                        output_dir=None, top_n_genes=20, 
-                                        conserved_fraction=0.5, interpolation_factor=1,
-                                        spline_degree=3, spline_smoothing=0.5, 
-                                        model_type='spline', verbose=True,
-                                        max_genes_to_plot=10):
+def run_trajectory_conservation_analysis(
+    adata_path,
+    output_dir,
+    pseudo_col='pseudo',
+    batch_col='Sample',
+    n_bins=100,
+    adaptive_kernel=True,
+    gene_thred=0.1,
+    batch_thred=0.4,
+    tail_num=0.05,
+    ensure_tail=True,
+    dtw_radius=3,
+    use_fastdtw=True,
+    normalize='zscore',
+    variation_filter_level='basic',
+    top_n_genes=4000,
+    spline_smoothing=2,
+    interpolation_factor=1,
+    n_jobs=-1,
+    save_figures=True,
+    gene_subset=None,
+    layer="logcounts"
+):
     """
-    Run the entire conserved sample fitting pipeline in one function call.
-    
-    This pipeline:
-    1. Processes the AnnData object into a 3D array
-    2. Calculates pairwise distances for all genes
-    3. Identifies the most conserved samples for each gene
-    4. Fits both standard and DTW-optimized models using only conserved samples
-    5. Creates visualizations of the fitting results
-    6. Generates a comprehensive summary report
+    Run trajectory conservation analysis on scRNA-seq data.
     
     Parameters:
     -----------
-    adata : AnnData
-        AnnData object containing gene expression data
-    batch_key : str
-        Key in adata.obs for batch/sample information
-    time_key : str
-        Key in adata.obs for pseudotime information
-    n_jobs : int, optional (default=4)
-        Number of parallel jobs for computations
-    output_dir : str or pathlib.Path, optional
-        Directory to save outputs (if None, a directory named 'conserved_fitting_results' 
-        will be created in the current working directory)
-    top_n_genes : int, optional (default=20)
-        Number of top most conserved genes to analyze
-    conserved_fraction : float, optional (default=0.5)
-        Fraction of most conserved samples to use for each gene (0.0-1.0)
-    interpolation_factor : int, optional (default=2)
-        Factor for interpolating time points
-    spline_degree : int, optional (default=3)
-        Degree of the spline for fitting
-    spline_smoothing : float, optional (default=0.5)
-        Smoothing parameter for standard spline fitting
-    model_type : str, optional (default='spline')
-        Type of model to fit ('spline' or other supported types)
-    verbose : bool, optional (default=True)
-        Whether to print progress information
-    max_genes_to_plot : int, optional (default=10)
-        Maximum number of genes to create visualizations for
+    adata_path : str
+        Path to the AnnData h5ad file
+    output_dir : str or Path
+        Directory to save output files
+    pseudo_col : str, default='pseudo'
+        Column in adata.obs containing pseudotime values
+    batch_col : str, default='Sample'
+        Column in adata.obs containing batch/sample information
+    n_bins : int, default=100
+        Number of interpolation points along pseudotime
+    adaptive_kernel : bool, default=True
+        Whether to use adaptive kernel width for interpolation
+    gene_thred : float, default=0.1
+        Filter genes expressed in at least this fraction of bins
+    batch_thred : float, default=0.3
+        Filter batches covering at least this fraction of timeline
+    ensure_tail : bool, default=True
+        Ensure batches cover the tail region
+    dtw_radius : int, default=3
+        Radius parameter for fastdtw algorithm
+    use_fastdtw : bool, default=True
+        Whether to use fastdtw algorithm
+    normalize : str, default='zscore'
+        Method to normalize trajectories before DTW calculation
+    variation_filter_level : str, default='basic'
+        Level of filtering for sample variation ('off', 'basic', 'stringent')
+    top_n_genes : int, default=4000
+        Number of top conserved genes to select for fitting
+    spline_smoothing : float, default=2
+        Smoothing parameter for spline fitting
+    interpolation_factor : int, default=1
+        Factor for interpolation when fitting
+    n_jobs : int, default=-1
+        Number of parallel jobs (-1 for all available cores)
+    save_figures : bool, default=True
+        Whether to save visualization figures
+    gene_subset : list, default=None
+        Optional list of genes to use (if None, all genes are used)
+    layer : str, default="logcounts"
+        Layer in anndata to use for expression values
         
     Returns:
     --------
     dict
         Dictionary containing:
-        - 'standard_results': Results from standard fitting
-        - 'optimized_results': Results from DTW-optimized fitting
-        - 'top_gene_names': Names of fitted genes
-        - 'visualizations': Paths to visualization files
-        - 'summary_file': Path to summary report
-        - 'pairwise_distances': Calculated pairwise distances
-        - 'conserved_samples': Dictionary of conserved samples for each gene
-        - 'top_genes_data': List of gene-specific datasets
+        - conservation_results: Results from conservation analysis
+        - fit_results: Results from trajectory fitting
+        - filtered_genes: List of filtered genes
+        - selected_genes: List of selected genes for fitting
+        - reshaped_data: 3D matrix of expression data
     """
-    import numpy as np
     import scanpy as sc
+    import numpy as np
     import pandas as pd
-    from pathlib import Path
-    import time
     import matplotlib.pyplot as plt
-    import sys
+    import seaborn as sns
+    from pathlib import Path
     import os
+    from datetime import datetime
     
-    # Add current directory to path to ensure imports work
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    if current_dir not in sys.path:
-        sys.path.append(current_dir)
+    # Import from the trajDTW package
+    from trajDTW import (
+        anndata_to_3d_matrix, 
+        calculate_trajectory_conservation,
+        TrajectoryFitter,
+        get_most_conserved_samples,
+        fit_with_conserved_samples,
+        extract_pairwise_distances,
+        create_gene_position_mapping
+    )
     
-    # Try different import strategies for trajectory_fitter
-    try:
-        from .trajectory_fitter import TrajectoryFitter
-    except ImportError:
-        try:
-            from .trajectory_fitter import TrajectoryFitter
-        except ImportError:
-            # Try relative import from parent directory
-            parent_dir = os.path.dirname(current_dir)
-            if parent_dir not in sys.path:
-                sys.path.append(parent_dir)
-            try:
-                from utils.trajectory_fitter import TrajectoryFitter
-            except ImportError:
-                raise ImportError("Could not import TrajectoryFitter. Make sure the module is installed or in the Python path.")
-    
-    # Set up output directory
-    if output_dir is None:
-        output_dir = Path.cwd() / "conserved_fitting_results"
-    else:
-        output_dir = Path(output_dir)
+    # Convert output_dir to Path
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    start_time = time.time()
-    if verbose:
-        print(f"Starting conserved sample fitting pipeline...")
-        print(f"Output will be saved to: {output_dir}")
-    
-    # Step 1: Process AnnData into 3D array
-    if verbose:
-        print("\n1. Processing AnnData object into 3D array...")
-    
-    gene_names = adata.var_names.tolist()
-    batch_names = adata.obs[batch_key].cat.categories.tolist() if hasattr(adata.obs[batch_key], 'cat') else sorted(adata.obs[batch_key].unique())
-    
-    # Get unique time points from adata for metadata only
-    orig_time_points = np.sort(adata.obs[time_key].unique())
-    
-    # Reshape data into 3D array: (batches, time points, genes)
-    try:
-        result = anndata_to_3d_matrix(
-            adata=adata,
-            pseudo_col=time_key,     # Column containing pseudotime
-            batch_col=batch_key,     # Column containing batch information
-            n_bins=100,              # Number of interpolation points
-            adaptive_kernel=True,    # Use adaptive kernel width
-            gene_thred=0.1,          # Filter genes expressed in at least 10% of bins
-            batch_thred=0.3,         # Set to 0 to keep all batches (was 0.3)
-            ensure_tail=True         # Ensure batches cover the tail region
-        )
-        # Extract components from the result dictionary
-        reshaped_data = result['reshaped_data']  # 3D array (batch x time x gene)
-        filtered_genes = result['filtered_genes']
-        batch_names = result['batch_names']
-        
-        # Check if any batches were returned
-        if reshaped_data.shape[0] == 0:
-            if verbose:
-                print("   - Warning: No batches passed filtering. Trying again with different parameters...")
-            # Try again with even more lenient parameters
-            result = anndata_to_3d_matrix(
-                adata=adata,
-                pseudo_col=time_key,
-                batch_col=batch_key,
-                n_bins=100,
-                adaptive_kernel=False,  # Turn off adaptive kernel
-                gene_thred=0.05,        # Lower gene threshold
-                batch_thred=0.3,        # No batch threshold
-                ensure_tail=False       # Don't ensure tail coverage
-            )
-            reshaped_data = result['reshaped_data']
-            filtered_genes = result['filtered_genes']
-            batch_names = result['batch_names']
-            
-        # If still no batches, we'll need to create synthetic data or raise an error
-        if reshaped_data.shape[0] == 0:
-            raise ValueError("No batches passed filtering even with lenient parameters. Cannot continue with fitting.")
-            
-    except Exception as e:
-        raise RuntimeError(f"Error reshaping data: {str(e)}")
-    
-    # Calculate time points for modeling (consistent with build_matrix.py approach)
-    time_points = np.linspace(0, 1, reshaped_data.shape[1])
-    
-    if verbose:
-        print(f"   - Data reshaped to 3D array with shape: {reshaped_data.shape}")
-        print(f"   - Number of batches: {len(batch_names)}")
-        print(f"   - Number of time points: {len(time_points)}")
-        print(f"   - Number of genes: {len(filtered_genes)}")
-    
-    # Step 2: Calculate pairwise distances for conservation analysis
-    if verbose:
-        print("\n2. Calculating pairwise distances for conservation analysis...")
-    
-    # Create visualization directory
-    viz_dir = output_dir / "visualizations"
-    viz_dir.mkdir(exist_ok=True)
-    
-    try:
-        conservation_results = calculate_trajectory_conservation(
-            trajectory_data=reshaped_data,
-            gene_names=filtered_genes, 
-            save_dir=output_dir,
-            prefix="traj_conservation",
-            dtw_radius=3,            # Radius parameter for fastdtw
-            use_fastdtw=True,
-            normalize='zscore',      # Normalize trajectories before DTW calculation
-            filter_samples_by_variation=True,  # Filter out samples with too little variation
-            variation_threshold=0.1,          # Minimum coefficient of variation
-            variation_metric='max',           # Metric for variation
-            min_valid_samples=2               # At least 2 samples needed
-        )
-        
-        # Extract key results
-        pairwise_distances = conservation_results['pairwise_distances']
-        conservation_scores = conservation_results['conservation_scores']
-        similarity_matrix = conservation_results['similarity_matrix']
-        print(conservation_scores.head())
-        # Print info about pairwise_distances
-        if verbose:
-            print(f"   - Pairwise distances dictionary contains {len(pairwise_distances)} genes")
-
-    except Exception as e:
-        raise RuntimeError(f"Error calculating conservation scores: {str(e)}")
-    
-    # Get mean conservation scores for each gene - using the correct data structure
-    if isinstance(conservation_scores, pd.DataFrame):
-        # Sort by normalized_score if it exists
-        if 'normalized_score' in conservation_scores.columns:
-            # Filter out genes that were filtered by variation if that column exists
-            if 'was_filtered' in conservation_scores.columns:
-                top_conserved = conservation_scores[~conservation_scores['was_filtered']].head(top_n_genes)
-            else:
-                top_conserved = conservation_scores.head(top_n_genes)
-            
-            top_gene_names = top_conserved['gene'].tolist()
-        else:
-            # Fall back to just taking the first top_n_genes
-            top_gene_names = conservation_scores['gene'].tolist()[:top_n_genes]
-    else:
-        # If conservation_scores is not a DataFrame, assume it's a simple list/array of scores
-        sorted_indices = np.argsort(conservation_scores)[:top_n_genes]
-        top_gene_names = [filtered_genes[i] for i in sorted_indices]
-    print("top_gene_names", top_gene_names)
-    if verbose:
-        print(f"   - Pairwise distances calculated for {len(filtered_genes)} genes")
-        print(f"   - Selected top {top_n_genes} most conserved genes for detailed analysis")
-    
-    # Step 3: Identify most conserved samples for each gene
-    if verbose:
-        print("\n3. Identifying most conserved samples for each gene...")
-    
-    try:
-        # Get the number of samples
-        n_samples = reshaped_data.shape[0]
-        
-        # Get most conserved samples for each gene
-        conserved_samples = get_most_conserved_samples(
-            pairwise_distances, 
-            n_samples=n_samples,  # Explicitly passing n_samples
-            fraction=conserved_fraction
-        )
-        print(conserved_samples)
-        # Check if conserved_samples is empty
-        if not conserved_samples:
-            if verbose:
-                print("   - Warning: No conserved samples found. Using all samples for each gene.")
-            # Create a fallback conserved_samples dictionary
-            # For each gene, use all samples
-            conserved_samples = {gene_name: list(range(n_samples)) for gene_name in top_gene_names}
-        
-        avg_samples = sum(len(samples) for samples in conserved_samples.values()) / len(conserved_samples) if conserved_samples else 0
-        if verbose:
-            print(f"   - Selected {conserved_fraction*100:.0f}% most conserved samples for each gene")
-            print(f"   - Average number of samples selected per gene: {avg_samples:.1f}")
-    except Exception as e:
-        raise RuntimeError(f"Error identifying conserved samples: {str(e)}")
-    
-    # Step 4: Fit models using only conserved samples
-    if verbose:
-        print("\n4. Fitting models using only the most conserved samples...")
-    
-    try:
-        # Find indices in filtered_genes for top_gene_names
-        top_gene_positions = []
-        print("filtering: top_gene_names", top_gene_names)
-        for gene_name in top_gene_names:
-            gene_pos = np.where(filtered_genes == gene_name)[0]
-            if len(gene_pos) > 0:
-                top_gene_positions.append(gene_pos[0])
-            else:
-                raise ValueError(f"Gene {gene_name} not found in filtered_genes")
-        
-        # Create specialized datasets for each gene
-        top_genes_data = []
-        print("conserved_samples", conserved_samples)   
-        for i, gene_name in enumerate(top_gene_names):
-            print("gene_name", gene_name)
-            gene_pos = top_gene_positions[i]
-
-            # Get the most conserved samples for this gene
-            if gene_name in conserved_samples:
-                cons_sample_indices = conserved_samples[gene_name]
-                n_cons_samples = len(cons_sample_indices)
-                
-                # Extract data only for the most conserved samples for this gene
-                gene_data = reshaped_data[cons_sample_indices, :, gene_pos]
-                
-                # Reshape to match expected input format (samples, timepoints, 1 feature)
-                gene_data = gene_data.reshape(n_cons_samples, reshaped_data.shape[1], 1)
-                
-                if verbose and i == 0:  # Print just for the first gene as example
-                    print(f"   - For gene {gene_name}: Using {n_cons_samples} out of {n_samples} samples")
-            else:
-                # Fallback if gene not in conserved_samples
-                if verbose:
-                    print(f"   - Gene {gene_name}: Using all samples (gene not found in conserved samples dict)")
-                gene_data = reshaped_data[:, :, gene_pos:gene_pos+1]
-            
-            top_genes_data.append(gene_data)
-        print('filtered_genes', filtered_genes)
-        print('top_gene_names', top_gene_names)
-        # Perform fitting using fit_with_conserved_samples
-        fitting_results = fit_with_conserved_samples(
-            reshaped_data=reshaped_data,  # Pass full reshaped data
-            gene_names=top_gene_names,    # Pass all filtered genes
-            conserved_samples=conserved_samples,  # Pass conserved samples dict
-            top_n_genes=len(top_gene_names),  # Pass actual number of top genes
-            n_jobs=n_jobs,
-            verbose=verbose,
-            interpolation_factor=interpolation_factor,
-            model_type=model_type,
-            spline_degree=spline_degree,
-            spline_smoothing=spline_smoothing,
-            use_dtw_optimization=True
-        )
-        
-        standard_results = fitting_results['standard_results']
-        optimized_results = fitting_results['optimized_results']
-        
-        # Add model_score as negative mean of dtw_distances (matching build_matrix.py)
-        if 'model_score' not in standard_results:
-            standard_results['model_score'] = -np.mean(standard_results['dtw_distances'])
-        if 'model_score' not in optimized_results:
-            optimized_results['model_score'] = -np.mean(optimized_results['dtw_distances'])
-            
-        # Add mean_dtw_distance for compatibility with example_pipeline.py
-        standard_results['mean_dtw_distance'] = np.mean(standard_results['dtw_distances'])
-        optimized_results['mean_dtw_distance'] = np.mean(optimized_results['dtw_distances'])
-    
-    except Exception as e:
-        raise RuntimeError(f"Error fitting models: {str(e)}")
-    
-    # Step 5: Create visualizations
-    if verbose:
-        print("\n5. Creating visualizations of fitting results...")
-    
-    try:
-        visualization_paths = visualize_fitting_results(
-            standard_results=standard_results,
-            optimized_results=optimized_results,
-            top_genes_data=top_genes_data,
-            top_gene_names=top_gene_names,
-            time_points=standard_results['time_points'],  # Use time_points from the fitting results
-            output_dir=output_dir,
-            max_genes_to_plot=max_genes_to_plot
-        )
-    except Exception as e:
-        if verbose:
-            print(f"Warning: Error creating visualizations: {str(e)}")
-        visualization_paths = {"error": str(e)}
-    
-    # Step 6: Generate summary report
-    if verbose:
-        print("\n6. Generating comprehensive summary report...")
-    
-    try:
-        summary_file = create_fitting_summary(
-            standard_results=standard_results,
-            optimized_results=optimized_results,
-            top_gene_names=top_gene_names,
-            top_genes_data=top_genes_data,
-            output_file=output_dir / "fitting_summary.txt",
-            adata_shape=adata.shape,
-            reshaped_data_shape=reshaped_data.shape,
-            batch_names=batch_names
-        )
-    except Exception as e:
-        if verbose:
-            print(f"Warning: Error creating summary report: {str(e)}")
-        summary_file = str(output_dir / "fitting_summary_error.txt")
-        with open(summary_file, 'w') as f:
-            f.write(f"Error creating summary: {str(e)}\n")
-    
-    # Calculate overall time
-    elapsed_time = time.time() - start_time
-    if verbose:
-        print(f"\nPipeline completed in {elapsed_time:.2f} seconds")
-        print(f"Results saved to: {output_dir}")
-        print(f"Summary report: {summary_file}")
-    
-    # Return comprehensive results dictionary
-    return {
-        'standard_results': standard_results,
-        'optimized_results': optimized_results,
-        'top_gene_names': top_gene_names,
-        'visualizations': visualization_paths if 'visualization_paths' in locals() else None,
-        'summary_file': summary_file,
-        'pairwise_distances': pairwise_distances,
-        'conserved_samples': conserved_samples,
-        'top_genes_data': top_genes_data
+    # Define variation filtering parameters
+    VARIATION_FILTERING = {
+        'off': {
+            'filter_samples_by_variation': False
+        },
+        'basic': {
+            'filter_samples_by_variation': True,
+            'variation_threshold': 0.1,  # Minimum coefficient of variation
+            'variation_metric': 'max',
+            'min_valid_samples': 2       # At least 2 samples needed
+        },
+        'stringent': {
+            'filter_samples_by_variation': True,
+            'variation_threshold': 0.2, 
+            'variation_metric': 'max',
+            'min_valid_samples': 2
+        }
     }
+    
+    # Setup logging
+    log_file = output_dir / f"run_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    
+    def log(message):
+        """Log message to both console and file"""
+        print(message)
+        with open(log_file, 'a') as f:
+            f.write(f"{message}\n")
+    
+    # Start the analysis
+    log(f"\n=== Trajectory Conservation Analysis Pipeline ===")
+    log(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"Input data: {adata_path}")
+    log(f"Output directory: {output_dir}")
+    
+    # ================ 1. BUILD 3D MATRIX ================
+    log("\n1. Building 3D Matrix from AnnData")
+    log("-" * 50)
+    
+    # Load AnnData
+    log("Loading AnnData...")
+    adata = sc.read_h5ad(adata_path)
+    
+    # Apply gene subset if provided
+    if gene_subset is not None:
+        adata = adata[:, gene_subset].copy()
+        log(f"Using subset of {len(gene_subset)} genes")
+    
+    log(f"AnnData shape: {adata.shape}")
+    
+    # Convert to 3D matrix
+    log("\nConverting to 3D matrix using Gaussian kernel interpolation...")
+    result = anndata_to_3d_matrix(
+        adata=adata,
+        pseudo_col=pseudo_col,
+        batch_col=batch_col,
+        n_bins=n_bins,
+        adaptive_kernel=adaptive_kernel,
+        gene_thred=gene_thred,
+        batch_thred=batch_thred,
+        tail_num= tail_num,
+        ensure_tail=ensure_tail,
+        layer=layer
+    )
+    reshaped_data = result["reshaped_data"]
+    filtered_genes = result['filtered_genes']
+    batch_names = result['batch_names']
+    
+    # Save reshaped_data as npy file
+    log("Saving reshaped data as npy file...")
+    np.save(output_dir / "reshaped_data.npy", reshaped_data)
+    pd.DataFrame(filtered_genes).to_csv(output_dir / "filtered_genes.csv")
+    pd.DataFrame(batch_names).to_csv(output_dir / "batch_names.csv")
+    log(f"Reshaped data dimensions: {reshaped_data.shape}")
+    log(f"Number of filtered genes: {len(filtered_genes)}")
+    log(f"Batches included: {batch_names}")
+    
+    # ================ 2. CALCULATE CONSERVATION ================
+    log("\n2. Calculating Trajectory Conservation")
+    log("-" * 50)
+    
+    filter_params = VARIATION_FILTERING[variation_filter_level]
+    log(f"Using variation filter level: {variation_filter_level}")
+    
+    log("Calculating trajectory conservation...")
+    conservation_results = calculate_trajectory_conservation(
+        trajectory_data=reshaped_data,
+        gene_names=filtered_genes, 
+        save_dir=output_dir,
+        prefix="traj_conservation",
+        dtw_radius=dtw_radius,
+        use_fastdtw=use_fastdtw,
+        normalize=normalize,
+        **filter_params
+    )
+    
+    # Extract and save pairwise distances
+    log("Extracting pairwise distances...")
+    pairwise_distances_df = extract_pairwise_distances(
+        conservation_results, 
+        output_csv=output_dir / "pairwise_distances.csv"
+    )
+    
+    # Save conservation scores
+    conservation_scores_df = conservation_results["conservation_scores"]
+    conservation_scores_df.to_csv(output_dir / "conservation_scores.csv")
+    log(f"Conservation scores saved to: {output_dir / 'conservation_scores.csv'}")
+    
+    # Select top conserved genes
+    log(f"Selecting top {top_n_genes} conserved genes for fitting...")
+    selected_genes = np.array(conservation_scores_df["gene"].head(n=top_n_genes))
+    
+    # Create gene position mapping
+    log("Creating gene position mapping...")
+    gene_mapping = create_gene_position_mapping(selected_genes, filtered_genes)
+    
+    # ================ 3. FIT TRAJECTORIES ================
+    log("\n3. Fitting Gene Expression Trajectories")
+    log("-" * 50)
+    
+    log("Fitting trajectories with conserved samples...")
+    fit_res = fit_with_conserved_samples(
+        reshaped_data=reshaped_data, 
+        gene_names=selected_genes,
+        gene_positions=gene_mapping,
+        conserved_samples=conservation_results["conserved_samples"], 
+        interpolation_factor=interpolation_factor,
+        top_n_genes=None,  # Use all selected genes
+        verbose=True, 
+        spline_smoothing=spline_smoothing,
+        n_jobs=n_jobs
+    )
+    
+    # Save fitted trajectories
+    log("Saving fitted trajectories...")
+    fitdf = pd.DataFrame(fit_res["standard_results"]["fitted_trajectories"])
+    fitdf.columns = fit_res["top_gene_names"]
+    fitdf.to_csv(output_dir / "fitted_trajectories.csv")
+    
+    fitdfOptimized = pd.DataFrame(fit_res["optimized_results"]["fitted_trajectories"])
+    fitdfOptimized.columns = fit_res["top_gene_names"]
+    fitdfOptimized.to_csv(output_dir / "fitted_trajectories_optimized.csv")
+    
+    # ================ 4. VISUALIZATIONS ================
+    if save_figures:
+        log("\n4. Creating Visualizations")
+        log("-" * 50)
+        
+        # 1. Heatmap of fitted trajectories
+        log("Creating heatmap of fitted trajectories...")
+        plt.figure(figsize=(16, 12))
+        sns.heatmap(fitdf, cmap='viridis', cbar=True)
+        plt.title("Fitted Gene Expression Trajectories")
+        plt.xlabel("Genes")
+        plt.ylabel("Pseudotime Points")
+        plt.savefig(output_dir / "fitted_trajectories_heatmap.png", bbox_inches='tight', dpi=300)
+        
+        # 2. K-means clustering of genes
+        log("Performing K-means clustering of genes...")
+        from sklearn.cluster import KMeans
+        
+        # Choose number of clusters (this can be parameterized)
+        n_clusters = 8
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(fitdf.T)  # Transpose to cluster genes
+        
+        # Add cluster labels to gene data
+        gene_clusters = pd.DataFrame({
+            'gene': fit_res["top_gene_names"],
+            'cluster': cluster_labels
+        })
+        gene_clusters.to_csv(output_dir / "gene_clusters.csv", index=False)
+        
+        # 3. Clustered heatmap
+        log("Creating clustered heatmap...")
+        # Sort genes by cluster
+        order = gene_clusters.sort_values('cluster').index
+        fitdf_clustered = fitdf[fit_res["top_gene_names"][order]]
+        
+        plt.figure(figsize=(16, 12))
+        sns.heatmap(fitdf_clustered, cmap='viridis', cbar=True)
+        plt.title("K-means Clustered Gene Expression Trajectories")
+        plt.xlabel("Genes (Clustered)")
+        plt.ylabel("Pseudotime Points")
+        plt.savefig(output_dir / "clustered_fitted_trajectories_heatmap.png", bbox_inches='tight', dpi=300)
+        
+        # 4. Cluster profile plot
+        log("Creating cluster profile plot...")
+        plt.figure(figsize=(14, 10))
+        
+        for cluster in range(n_clusters):
+            cluster_genes = gene_clusters[gene_clusters['cluster'] == cluster]['gene']
+            if len(cluster_genes) > 0:
+                cluster_data = fitdf[cluster_genes].mean(axis=1)
+                plt.plot(cluster_data, label=f'Cluster {cluster} (n={len(cluster_genes)})')
+        
+        plt.title("Average Expression Profiles by Cluster")
+        plt.xlabel("Pseudotime Points")
+        plt.ylabel("Average Expression")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_dir / "cluster_profiles.png", bbox_inches='tight', dpi=300)
+    
+    log("\n=== Analysis Complete ===")
+    log(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Return results
+    return {
+        'conservation_results': conservation_results,
+        'fit_results': fit_res,
+        'filtered_genes': filtered_genes,
+        'selected_genes': selected_genes,
+        'reshaped_data': reshaped_data
+    }
+
+def create_gene_position_mapping(gene_names, filtered_genes=None, original_genes=None):
+    """
+    Create a mapping from gene names to their positions in a reshaped data array.
+    
+    This utility function helps create the gene_positions dictionary needed for 
+    fit_with_conserved_samples when gene names don't directly map to positions
+    in the reshaped_data array.
+    
+    Parameters:
+    -----------
+    gene_names : list or numpy.ndarray
+        List of gene names to include in the mapping
+    filtered_genes : list or numpy.ndarray, optional
+        List of gene names that correspond to the third dimension of reshaped_data.
+        If provided, positions will be determined by finding each gene_name in filtered_genes.
+    original_genes : list or numpy.ndarray, optional
+        List of all original gene names before any filtering.
+        If provided (and filtered_genes also provided), will help trace gene positions
+        through the filtering process.
+        
+    Returns:
+    --------
+    dict
+        Dictionary mapping gene names to their positions
+    
+    Examples:
+    ---------
+    >>> # Simple case - create mapping for all genes
+    >>> gene_names = ['gene1', 'gene2', 'gene3']
+    >>> mapping = create_gene_position_mapping(gene_names)
+    >>> print(mapping)
+    {'gene1': 0, 'gene2': 1, 'gene3': 2}
+    
+    >>> # With filtering - map from original gene list to filtered positions
+    >>> original_genes = ['gene1', 'gene2', 'gene3', 'gene4', 'gene5']
+    >>> filtered_genes = ['gene1', 'gene3', 'gene5']  # gene2 and gene4 were filtered out
+    >>> mapping = create_gene_position_mapping(['gene1', 'gene5'], filtered_genes, original_genes)
+    >>> print(mapping)
+    {'gene1': 0, 'gene5': 2}
+    """
+    # Convert inputs to numpy arrays for easier searching
+    gene_names = np.array(gene_names)
+    
+    # Case 1: No filtering information provided
+    if filtered_genes is None:
+        # Simply map each gene to its position in the gene_names array
+        return {gene: i for i, gene in enumerate(gene_names)}
+    
+    # Case 2: Filtered genes provided
+    filtered_genes = np.array(filtered_genes)
+    mapping = {}
+    
+    for gene in gene_names:
+        # Find the gene in filtered_genes
+        matches = np.where(filtered_genes == gene)[0]
+        if len(matches) > 0:
+            # Gene found in filtered_genes, use its position
+            mapping[gene] = matches[0]
+        else:
+            # Gene not found in filtered_genes
+            if original_genes is not None:
+                # Try to find it in original_genes to give a helpful error
+                orig_matches = np.where(np.array(original_genes) == gene)[0]
+                if len(orig_matches) > 0:
+                    raise ValueError(f"Gene '{gene}' was found in original_genes but not in filtered_genes, suggesting it was filtered out")
+            
+            # Generic error if we can't find it anywhere
+            raise ValueError(f"Gene '{gene}' not found in filtered_genes")
+    
+    return mapping
+
+
 
 # Example usage:
 """
@@ -1544,13 +1600,23 @@ adata = sc.read_h5ad("your_data.h5ad")
 # adata.obs['pseudotime'] = ...
 # adata.obs['batch'] = ...
 
-# Convert to 3D matrix
+# Convert to 3D matrix using the default X matrix
 result = anndata_to_3d_matrix(
     adata=adata,
     pseudo_col='pseudotime',
     batch_col='batch',
     n_bins=100,
     adaptive_kernel=True
+)
+
+# Or convert using a specific layer (e.g., 'normalized' or 'counts')
+result_from_layer = anndata_to_3d_matrix(
+    adata=adata,
+    pseudo_col='pseudotime',
+    batch_col='batch',
+    n_bins=100,
+    adaptive_kernel=True,
+    layer='counts'  # Specify the layer to use
 )
 
 # Access results
@@ -1586,4 +1652,27 @@ print(most_conserved_genes)
 # Access pairwise distances for a specific gene
 gene_of_interest = filtered_genes[0]
 pairwise_dtw = conservation_results['pairwise_distances'][gene_of_interest]
+
+# Create gene position mapping for a subset of genes
+selected_genes = filtered_genes[:5]  # Select first 5 genes
+gene_mapping = create_gene_position_mapping(selected_genes, filtered_genes)
+
+# Fit models using only these specific genes with their positions
+fit_results = fit_with_conserved_samples(
+    reshaped_data=reshaped_data,
+    gene_names=selected_genes,
+    conserved_samples=conservation_results["conserved_samples"],
+    time_points=time_points,
+    gene_positions=gene_mapping
+)
+
+# Run the full pipeline with a specific layer
+pipeline_results = run_trajectory_conservation_analysis(
+    adata_path="your_data.h5ad",
+    output_dir="./analysis_results",
+    pseudo_col="pseudotime",
+    batch_col="batch",
+    layer="logcounts",
+    top_n_genes=500
+)
 """ 

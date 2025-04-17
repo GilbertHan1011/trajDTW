@@ -664,4 +664,196 @@ def plot_feature_variation(
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to {save_path}")
     
+    return fig
+
+############################
+# Gene Trajectory Plots #
+############################
+
+def plot_gene_trajectory(
+    reshaped_data: np.ndarray,
+    gene_idx: int,
+    gene_name: Optional[str] = None,
+    batch_labels: Optional[List[str]] = None,
+    figsize: Tuple[int, int] = (10, 6),
+    cmap: str = "viridis",
+    save_path: Optional[Union[str, Path]] = None
+) -> Figure:
+    """
+    Plot the expression trajectory of a single gene across pseudotime for all batches.
+
+    Parameters
+    ----------
+    reshaped_data : numpy.ndarray
+        3D array with shape (batch, pseudotime, gene)
+    gene_idx : int
+        Index of the gene to plot
+    gene_name : str, optional
+        Name of the gene for plot title
+    batch_labels : list of str, optional
+        Names of the batches for the legend
+    figsize : tuple, default=(10, 6)
+        Figure size
+    cmap : str, default="viridis"
+        Colormap for the batch lines
+    save_path : str or Path, optional
+        Path to save the figure. If None, the figure is not saved.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object
+    """
+    # Validate inputs
+    if gene_idx < 0 or gene_idx >= reshaped_data.shape[2]:
+        raise ValueError(f"Gene index {gene_idx} is out of range (0-{reshaped_data.shape[2]-1})")
+    
+    # Set default gene name and batch labels if not provided
+    if gene_name is None:
+        gene_name = f"Gene {gene_idx}"
+    
+    if batch_labels is None:
+        batch_labels = [f"Batch {i+1}" for i in range(reshaped_data.shape[0])]
+    
+    # Ensure we have the right number of batch labels
+    if len(batch_labels) < reshaped_data.shape[0]:
+        # Extend with default labels if we don't have enough
+        batch_labels.extend([f"Batch {i+1}" for i in range(len(batch_labels), reshaped_data.shape[0])])
+    elif len(batch_labels) > reshaped_data.shape[0]:
+        # Truncate if we have too many
+        batch_labels = batch_labels[:reshaped_data.shape[0]]
+    
+    # Extract data for the specified gene
+    n_batches, n_timepoints, _ = reshaped_data.shape
+    gene_data = reshaped_data[:, :, gene_idx]
+    
+    # Create pseudotime axis
+    pseudotime = np.linspace(0, 1, n_timepoints)
+    
+    # Set up the plot
+    fig, ax = plt.subplots(figsize=figsize)
+    colors = plt.cm.get_cmap(cmap, n_batches)
+    
+    # Plot each batch
+    for batch_idx in range(n_batches):
+        ax.plot(pseudotime, gene_data[batch_idx], 
+                label=batch_labels[batch_idx],
+                color=colors(batch_idx), 
+                linewidth=2.5, 
+                alpha=0.8)
+    
+    # Add plot details
+    ax.set_title(f"Expression trajectory of {gene_name} across pseudotime", fontsize=14)
+    ax.set_xlabel("Pseudotime", fontsize=12)
+    ax.set_ylabel("Expression level", fontsize=12)
+    ax.legend(title="Batches")
+    ax.grid(True, alpha=0.3)
+    
+    # Apply some styling
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    # Save the figure if specified
+    if save_path:
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+    
+    plt.tight_layout()
+    return fig
+
+def plot_gene_by_name(
+    gene_name: str,
+    reshaped_data: np.ndarray,
+    filtered_genes: Union[List[str], np.ndarray],
+    batch_names: Optional[List[str]] = None,
+    figsize: Tuple[int, int] = (12, 7),
+    cmap: str = "plasma",
+    save_path: Optional[Union[str, Path]] = None
+) -> Figure:
+    """
+    Plot a gene expression trajectory by gene name instead of index.
+    
+    This function finds the gene index by name and passes it to plot_gene_trajectory.
+    
+    Parameters
+    ----------
+    gene_name : str
+        Name of the gene to plot
+    reshaped_data : numpy.ndarray
+        3D array with shape (batch, pseudotime, gene)
+    filtered_genes : list or numpy.ndarray
+        List of gene names corresponding to the third dimension of reshaped_data
+    batch_names : list of str, optional
+        Names of the batches for the legend
+    figsize : tuple, default=(12, 7)
+        Figure size (width, height) in inches
+    cmap : str, default="plasma"
+        Colormap for the batch lines
+    save_path : str or Path, optional
+        Path to save the figure. If None, the figure is not saved.
+        
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object
+    """
+    # Find the gene index by name
+    filtered_genes = np.array(filtered_genes)
+    
+    try:
+        gene_index = np.where(filtered_genes == gene_name)[0][0]
+    except IndexError:
+        raise ValueError(f"Gene '{gene_name}' not found in filtered_genes")
+    
+    # Plot the gene trajectory
+    fig = plot_gene_trajectory(
+        reshaped_data=reshaped_data,
+        gene_idx=gene_index,
+        gene_name=gene_name,
+        batch_labels=batch_names,
+        figsize=figsize,
+        cmap=cmap,
+        save_path=save_path
+    )
+    
     return fig 
+
+# Example usage of gene trajectory visualization functions:
+'''
+# Example 1: Plot a gene by index
+fig1 = plot_gene_trajectory(
+    reshaped_data=reshaped_data,  # 3D array (batch, pseudotime, gene)
+    gene_idx=5,                   # Plot the 6th gene
+    gene_name="FOXP3",            # Optional: specify a gene name for the title
+    batch_labels=["Condition A", "Condition B"],  # Optional: custom batch labels
+    figsize=(12, 6),              # Optional: customize figure size
+    cmap="viridis",               # Optional: specify colormap
+    save_path="gene5_trajectory.png"  # Optional: save the figure
+)
+
+# Example 2: Plot a gene by name
+fig2 = plot_gene_by_name(
+    gene_name="FOXP3",            # Gene name to plot
+    reshaped_data=reshaped_data,  # 3D array (batch, pseudotime, gene)
+    filtered_genes=gene_names,    # List/array of gene names matching the 3rd dimension
+    batch_names=["Day 0", "Day 3", "Day 7"],  # Optional: batch names for legend
+    figsize=(14, 8),              # Optional: customize figure size
+    cmap="plasma",                # Optional: specify colormap
+    save_path="FOXP3_trajectory.png"  # Optional: save the figure
+)
+
+# Example 3: Plot multiple genes in a loop
+genes_of_interest = ["FOXP3", "IL2RA", "CTLA4"]
+for gene in genes_of_interest:
+    try:
+        fig = plot_gene_by_name(
+            gene_name=gene,
+            reshaped_data=reshaped_data,
+            filtered_genes=gene_names,
+            save_path=f"{gene}_trajectory.png"
+        )
+        plt.close(fig)  # Close figure to free memory
+    except ValueError as e:
+        print(f"Error plotting {gene}: {e}")
+''' 

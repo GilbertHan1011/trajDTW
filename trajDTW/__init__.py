@@ -10,7 +10,8 @@ from .cell_interpolation import (
     visualize_fitting_results,
     create_fitting_summary,
     fit_with_conserved_samples,
-    run_conserved_sample_fitting_pipeline
+    create_gene_position_mapping,
+    run_trajectory_conservation_analysis
 )
 
 from .trajectory_conservation import (
