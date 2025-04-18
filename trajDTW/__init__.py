@@ -37,6 +37,17 @@ from .visualization import (
     plot_fitted_trajectories,
     plot_clusters,
     plot_model_comparison,
-    plot_feature_variation
+    plot_feature_variation,
+    plot_gene_trajectory,
+    plot_gene_by_name
+)
+
+# Import trajectory attributes functions
+from .trajectory_attributes import (
+    TrajectoryAttributes,
+    calculate_trajectory_attributes,
+    make_dot_table,
+    plot_trajectory_dotplot,
+    attribute_to_dotplot
 )
 

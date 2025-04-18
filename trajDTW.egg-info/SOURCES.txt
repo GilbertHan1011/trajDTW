@@ -6,6 +6,7 @@ examples/run_pipeline.py
 examples/simple_example.py
 trajDTW/__init__.py
 trajDTW/cell_interpolation.py
+trajDTW/trajectory_attributes.py
 trajDTW/trajectory_conservation.py
 trajDTW/trajectory_fitter.py
 trajDTW/trajectory_utils.py
