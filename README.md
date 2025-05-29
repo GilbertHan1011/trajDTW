@@ -9,7 +9,7 @@ A Python package for trajectory conservation analysis and dynamic time warping f
 For development installation:
 
 ```bash
-git clone https://github.com/gilberthan/trajDTW.git
+git clone https://github.com/GilbertHan1011/trajDTW.git
 cd trajDTW
 pip install -e .
 ```
